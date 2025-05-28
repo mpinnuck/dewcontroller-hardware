@@ -17,7 +17,10 @@
 #define I2C_SCL 6
 #define THERMISTOR_PIN 3
 #define PWM_PIN 7
-#define LED_PIN 10
+#define LED_PIN 21
+#define ON LOW
+#define OFF HIGH
+
 
 
 #if DEBUG_MODE
@@ -156,7 +159,7 @@ void computeCalibrationFromCSV() {
 void setupWiFi() {
   i2cMutex = xSemaphoreCreateMutex();
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);  // Start with LED off
+  digitalWrite(LED_PIN, OFF);  // Start with LED off
 
   sendLog("📶 Target SSID: " + wifiSSID);
 
@@ -178,7 +181,7 @@ void setupWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, HIGH);  // Solid LED = connected
+    digitalWrite(LED_PIN, ON);  // Start with LED off
     sendLog("✅ WiFi connected, IP: " + WiFi.localIP().toString());
   } else {
     WiFi.mode(WIFI_AP);
@@ -532,7 +535,7 @@ void loop() {
 
   if (millis() - lastUpdate >= LOOP_INTERVAL_MS) {
     lastUpdate = millis();
-///*
+  // Orange LED blinks when wifi in AP mode
     static unsigned long lastLED = 0;
     static bool ledState = false;
     if (WiFi.getMode() == WIFI_AP) {
@@ -542,7 +545,7 @@ void loop() {
         digitalWrite(LED_PIN, ledState);
       }
     }
-//*/
+
 #if SIMULATE_HARDWARE
     ambientTemp = 17.0 + sin(millis() / 12000.0);
     humidity = 78.0 + sin(millis() / 8000.0);
