@@ -5,10 +5,12 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <time.h>
 
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
-#define DEBUG_MODE 1
+#define DEBUG_MODE 0
 #define CONFIG_FILE "/config.json"
 #define CALIBRATION_FILE "/calibration.csv"
 #define LOOP_INTERVAL_MS 2000
@@ -156,41 +158,106 @@ void computeCalibrationFromCSV() {
   }
 }
 
-void setupWiFi() {
-  i2cMutex = xSemaphoreCreateMutex();
+void setupWiFiX() {
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, OFF);  // Start with LED off
+  digitalWrite(LED_PIN, LOW);  // start with LED off
 
-  sendLog("📶 Target SSID: " + wifiSSID);
-
-  WiFi.mode(WIFI_STA);
+  sendLog("🔌 Connecting to Wi-Fi...");
   WiFi.disconnect(true);
   delay(100);
+  WiFi.mode(WIFI_STA);
 
-  // Try to connect regardless (maybe hidden network or weak signal)
+  WiFi.setHostname("DewController");  // Set hostname before connect
+
   WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-  sendLog("🔌 Attempting connection...");
 
-  int maxRetries = 15;
+  int maxRetries = 10;
   int retries = 0;
+
   while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
     delay(500);
-    wl_status_t status = WiFi.status();
-//    sendLog("⏳ Attempt " + String(retries + 1) + ": Status = " + String(status));
     retries++;
+    sendLog("⏳ Attempt " + String(retries) + ": Status = " + String(WiFi.status()));
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, ON);  // Start with LED off
-    sendLog("✅ WiFi connected, IP: " + WiFi.localIP().toString());
+    digitalWrite(LED_PIN, HIGH);  // solid ON
+    sendLog("✅ WiFi IP: " + WiFi.localIP().toString());
+
+    // Start MDNS responder
+    if (!MDNS.begin("DewController")) {
+      sendLog("❌ Error setting up MDNS responder!");
+    } else {
+      sendLog("✅ MDNS responder started as DewController.local");
+      MDNS.addService("http", "tcp", 80);  // Add this line
+      sendLog("✅ MDNS service _http._tcp added");
+    }
+
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("DewHeaterSetup");
-    sendLog("🚨 Fallback to AP mode");
-    sendLog("📡 AP IP: " + WiFi.softAPIP().toString());
+    sendLog("❌ WiFi failed. Starting fallback AP...");
+    sendLog("📡 AP mode IP: " + WiFi.softAPIP().toString());
   }
 }
 
+void setupWiFi() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  sendLog("🔌 Connecting to Wi-Fi...");
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("DewController");
+  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+
+  int maxRetries = 10;
+  int retries = 0;
+
+  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
+    delay(500);
+    retries++;
+    sendLog("⏳ Attempt " + String(retries) + ": Status = " + String(WiFi.status()));
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_PIN, HIGH);
+    sendLog("✅ WiFi IP: " + WiFi.localIP().toString());
+
+    // Start MDNS
+    if (!MDNS.begin("DewController")) {
+      sendLog("❌ Error setting up MDNS responder!");
+    } else {
+      sendLog("✅ MDNS responder started as DewController.local");
+    }
+
+    // ⏰ Configure NTP time
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+    // Wait for time to be set
+    struct tm timeinfo;
+    int waitCount = 0;
+    while (!getLocalTime(&timeinfo) && waitCount < 20) {
+      delay(200);
+      waitCount++;
+    }
+
+    if (getLocalTime(&timeinfo)) {
+      char buf[64];
+      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      sendLog(String("⏰ NTP time set: ") + buf);
+    } else {
+      sendLog("⚠️ Failed to get NTP time.");
+    }
+
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("DewHeaterSetup");
+    sendLog("❌ WiFi failed. Starting fallback AP...");
+    sendLog("📡 AP mode IP: " + WiFi.softAPIP().toString());
+  }
+}
 
 void setupWebServer() {
   server.on("/", []() {
@@ -504,9 +571,11 @@ void sensorTask(void* parameter) {
 void setup() {
   // clear log
   logBuffer = "";
-
+#if DEBUG_MODE
   Serial.begin(115200);
   delay(1200);  // Allow time for Serial to initialize
+#endif
+
   sendLog("🚀 Sketch started");
 
   pinMode(PWM_PIN, OUTPUT);
@@ -538,12 +607,32 @@ void loop() {
   // Orange LED blinks when wifi in AP mode
     static unsigned long lastLED = 0;
     static bool ledState = false;
+    static int currentLedMode = -1;  // -1 = unknown, 0 = OFF, 1 = ON, 2 = BLINKING
+
     if (WiFi.getMode() == WIFI_AP) {
-      if (millis() - lastLED > 500) {
-        lastLED = millis();
-        ledState = !ledState;
-        digitalWrite(LED_PIN, ledState);
-      }
+        if (currentLedMode != 2) {
+            currentLedMode = 2;
+            lastLED = millis();  // reset blinking
+            ledState = false;
+            digitalWrite(LED_PIN, ledState);
+        }
+        if (millis() - lastLED > 500) {
+            lastLED = millis();
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+        }
+    }
+    else if (WiFi.status() == WL_CONNECTED) {
+        if (currentLedMode != 1) {
+            currentLedMode = 1;
+            digitalWrite(LED_PIN, ON);
+        }
+    }
+    else {
+        if (currentLedMode != 0) {
+            currentLedMode = 0;
+            digitalWrite(LED_PIN, OFF);
+        }
     }
 
 #if SIMULATE_HARDWARE
