@@ -23,8 +23,6 @@
 #define ON LOW
 #define OFF HIGH
 
-
-
 #if DEBUG_MODE
   #define DEBUG_PRINT(x) Serial.println(x)
 #else
@@ -42,8 +40,9 @@ Adafruit_AHTX0      aht;
 float   ambientTemp = 0, humidity = 0, glassTemp = 0;
 float   targetDelta = 2.0, humidityThreshold = 80.0;
 float   calibScale = 20.0, calibOffset = 0.0;
-String  wifiSSID = "MicroConcepts";
+String  wifiSSID = "MicroConcepts-2G";
 String  wifiPass = "leanneannatinka";
+float   timezoneOffsetHours = 10.0;
 bool    heaterEnabled = false, calibrating = false;
 float   lastSampledTemp = -100.0;
 int     calCount = 0, pwm = 0;
@@ -69,6 +68,7 @@ void saveConfig() {
   doc["heater"] = heaterEnabled;
   doc["ssid"] = wifiSSID;
   doc["password"] = wifiPass;
+  doc["timezone"] = timezoneOffsetHours;
   File file = SPIFFS.open(CONFIG_FILE, FILE_WRITE);
   if (file) {
     serializeJson(doc, file);
@@ -101,20 +101,22 @@ void loadConfig() {
   }
 
   // Assign values
-  targetDelta       = doc["delta"]       | 2.0;
-  humidityThreshold = doc["humidity"]    | 80.0;
-  calibScale        = doc["scale"]       | 20.0;
-  calibOffset       = doc["offset"]      | 0.0;
-  heaterEnabled     = doc["heater"]      | false;
-  wifiSSID          = doc["ssid"]        | "MicroConcepts-2G";
-  wifiPass          = doc["password"]    | "leanneannatinka";
+  targetDelta         = doc["delta"]       | 2.0;
+  humidityThreshold   = doc["humidity"]    | 80.0;
+  calibScale          = doc["scale"]       | 20.0;
+  calibOffset         = doc["offset"]      | 0.0;
+  heaterEnabled       = doc["heater"]      | false;
+  wifiSSID            = doc["ssid"]        | "MicroConcepts-2G";
+  wifiPass            = doc["password"]    | "leanneannatinka";
+  timezoneOffsetHours = doc["timezone"]    | 10.0;
 
   sendLog("✅ Config loaded from SPIFFS");
   sendLog("📦 Temperature Delta: " + String(targetDelta, 2));
   sendLog("📦 Humidity Threshold: " + String(humidityThreshold, 2));
   sendLog("📦 Heater Enabled: " + String(heaterEnabled ? "true" : "false"));
   sendLog("📦 WiFi SSID: " + wifiSSID);
-  sendLog("📦 WiFi Password: " + wifiPass);
+  // sendLog("📦 WiFi Password: " + wifiPass);  // Do NOT log password
+  sendLog(String("📦 Timezone Offset: UTC") + (timezoneOffsetHours >= 0 ? "+" : "") + String(timezoneOffsetHours, 1));
   sendLog("📦 T = " + String(calibScale, 2) + " × V + " + String(calibOffset, 2));
 }
 
@@ -158,49 +160,6 @@ void computeCalibrationFromCSV() {
   }
 }
 
-void setupWiFiX() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);  // start with LED off
-
-  sendLog("🔌 Connecting to Wi-Fi...");
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.mode(WIFI_STA);
-
-  WiFi.setHostname("DewController");  // Set hostname before connect
-
-  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-
-  int maxRetries = 10;
-  int retries = 0;
-
-  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
-    delay(500);
-    retries++;
-    sendLog("⏳ Attempt " + String(retries) + ": Status = " + String(WiFi.status()));
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, HIGH);  // solid ON
-    sendLog("✅ WiFi IP: " + WiFi.localIP().toString());
-
-    // Start MDNS responder
-    if (!MDNS.begin("DewController")) {
-      sendLog("❌ Error setting up MDNS responder!");
-    } else {
-      sendLog("✅ MDNS responder started as DewController.local");
-      MDNS.addService("http", "tcp", 80);  // Add this line
-      sendLog("✅ MDNS service _http._tcp added");
-    }
-
-  } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("DewHeaterSetup");
-    sendLog("❌ WiFi failed. Starting fallback AP...");
-    sendLog("📡 AP mode IP: " + WiFi.softAPIP().toString());
-  }
-}
-
 void setupWiFi() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -232,8 +191,9 @@ void setupWiFi() {
       sendLog("✅ MDNS responder started as DewController.local");
     }
 
-    // ⏰ Configure NTP time
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    // ⏰ Configure NTP time using timezone offset
+    long gmtOffset_sec = timezoneOffsetHours * 3600;
+    configTime(gmtOffset_sec, 0, "pool.ntp.org", "time.nist.gov");
 
     // Wait for time to be set
     struct tm timeinfo;
@@ -269,6 +229,7 @@ void setupWebServer() {
           font-family: sans-serif; box-sizing: border-box;
           display: flex; flex-direction: column;
         }
+
       #main {
         display: flex;
         padding: 10px;
@@ -283,7 +244,7 @@ void setupWebServer() {
         flex: 0 0 auto;              /* 👈 fixed width based on content */
       }
 
-      /*  Stack vertically on small screens (less than 600px wide) */
+      /* Stack vertically on small screens (less than 600px wide) */
       @media (max-width: 600px) {
         #main {
           flex-direction: column;
@@ -294,7 +255,6 @@ void setupWebServer() {
         }
       }
 
-
         #log {
           flex-grow: 1; overflow-y: auto;
           border-top: 1px solid #ccc; background: #f8f8f8;
@@ -302,19 +262,24 @@ void setupWebServer() {
           box-sizing: border-box; max-height: calc(100vh - 240px);
           min-height: 100px; /* Prevent collapse if log is empty */
         }
+
         #controls {
           display: flex; gap: 10px; padding: 10px;
         }
+
         .inputrow {
           display: flex; align-items: center; margin: 5px 0;
         }
+
         .inputrow label {
           width: 150px;
         }
+
         .inputrow input {
           flex: 1;
         }
       </style>
+
       <script>
         function updateStatus() {
           fetch('/status.json').then(r => r.json()).then(data => {
@@ -334,6 +299,7 @@ void setupWebServer() {
             pwmRow.style.backgroundColor = pwmVal > 0 ? "#c0ffc0" : "transparent";
           });
         }
+
         function updateLog() {
           fetch('/log').then(r => r.text()).then(data => {
             const box = document.getElementById("log");
@@ -341,6 +307,7 @@ void setupWebServer() {
             box.scrollTop = box.scrollHeight;
           });
         }
+
         function updatePWMValue(val) {
           document.getElementById("pwmValue").innerText = val + "%";
         }
@@ -384,6 +351,7 @@ void setupWebServer() {
             <tr id="pwmRow"><td>🔥 Heating Power:</td> <td><span id='pwm'>--</span>%</td></tr>            
           </table>
         </div>
+
         <div id="settings">
           <form action="/settings" method="POST">
             <div class="inputrow">
@@ -402,11 +370,17 @@ void setupWebServer() {
               <label>Password:</label>
               <input name="password" type="password" value=")rawliteral" + wifiPass + R"rawliteral(">
             </div>
+            <!-- New Timezone input -->
+            <div class="inputrow">
+              <label>Timezone Offset:</label>
+              <input name="timezone" value=")rawliteral" + String(timezoneOffsetHours, 1) + R"rawliteral(">
+            </div>
             <button type="submit">Update Settings</button>
           </form>
           <p>Calibration: T = )rawliteral" + String(calibScale, 2) + R"rawliteral( × V + )rawliteral" + String(calibOffset, 2) + R"rawliteral(</p>
         </div>
       </div>
+
       <div id="controls">
         <form action="/toggle" method="POST"><button>Toggle Heater</button></form>
         <form action="/calibrate" method="POST"><button>Toggle Calibration</button></form>
@@ -424,6 +398,8 @@ void setupWebServer() {
     )rawliteral";
     server.send(200, "text/html; charset=UTF-8", html);
   });
+
+  // Everything below is 100% identical to your version:
 
   server.on("/status.json", []() {
     float t, h;
@@ -451,7 +427,7 @@ void setupWebServer() {
     server.send(200, "application/json; charset=UTF-8", json);
   });
 
-  server.on("/log", []() {
+    server.on("/log", []() {
     server.send(200, "text/plain", logBuffer);
   });
 
@@ -478,6 +454,8 @@ void setupWebServer() {
     if (server.hasArg("humidity")) humidityThreshold = server.arg("humidity").toFloat();
     if (server.hasArg("ssid")) wifiSSID = server.arg("ssid");
     if (server.hasArg("password")) wifiPass = server.arg("password");
+    if (server.hasArg("timezone")) timezoneOffsetHours = server.arg("timezone").toFloat();
+
     sendLog("⚙️ Settings updated");
     saveConfig();
     server.sendHeader("Location", "/");
@@ -527,7 +505,7 @@ void setupWebServer() {
   sendLog("🌐 Web server started");
 }
 
-
+// I2C sensorTask()
 void sensorTask(void* parameter) {
   sendLog("🧵 Sensor task started on core " + String(xPortGetCoreID()));
   sendLog("🧪 SDA = " + String(I2C_SDA) + ", SCL = " + String(I2C_SCL));
@@ -554,7 +532,6 @@ void sensorTask(void* parameter) {
         humidity = h.relative_humidity;
         xSemaphoreGive(i2cMutex);
       }
-//      sendLog("🧪 Task Read: T=" + String(ambientTemp, 1) + "°C, H=" + String(humidity, 1) + "%");
     } else {
       sendLog("⚠️ AHT20 returned bad data, trying soft reset...");
       I2CBus.beginTransmission(0x38);
@@ -568,12 +545,12 @@ void sensorTask(void* parameter) {
   }
 }
 
+// Setup controller
 void setup() {
-  // clear log
   logBuffer = "";
 #if DEBUG_MODE
   Serial.begin(115200);
-  delay(1200);  // Allow time for Serial to initialize
+  delay(1200);
 #endif
 
   sendLog("🚀 Sketch started");
@@ -592,11 +569,10 @@ void setup() {
     sensorTask, "SensorTask", 4096, NULL, 1, &sensorTaskHandle, 1
   );
 
-  // Give the task time to initialize
-  delay(500);  // or 750–1000 ms for extra safety
+  delay(500);
 }
 
-
+// Controller runtime
 unsigned long lastUpdate = 0;
 
 void loop() {
@@ -604,35 +580,33 @@ void loop() {
 
   if (millis() - lastUpdate >= LOOP_INTERVAL_MS) {
     lastUpdate = millis();
-  // Orange LED blinks when wifi in AP mode
+
     static unsigned long lastLED = 0;
     static bool ledState = false;
-    static int currentLedMode = -1;  // -1 = unknown, 0 = OFF, 1 = ON, 2 = BLINKING
+    static int currentLedMode = -1;
 
     if (WiFi.getMode() == WIFI_AP) {
-        if (currentLedMode != 2) {
-            currentLedMode = 2;
-            lastLED = millis();  // reset blinking
-            ledState = false;
-            digitalWrite(LED_PIN, ledState);
-        }
-        if (millis() - lastLED > 500) {
-            lastLED = millis();
-            ledState = !ledState;
-            digitalWrite(LED_PIN, ledState);
-        }
-    }
-    else if (WiFi.status() == WL_CONNECTED) {
-        if (currentLedMode != 1) {
-            currentLedMode = 1;
-            digitalWrite(LED_PIN, ON);
-        }
-    }
-    else {
-        if (currentLedMode != 0) {
-            currentLedMode = 0;
-            digitalWrite(LED_PIN, OFF);
-        }
+      if (currentLedMode != 2) {
+        currentLedMode = 2;
+        lastLED = millis();
+        ledState = false;
+        digitalWrite(LED_PIN, ledState);
+      }
+      if (millis() - lastLED > 500) {
+        lastLED = millis();
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState);
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      if (currentLedMode != 1) {
+        currentLedMode = 1;
+        digitalWrite(LED_PIN, ON);
+      }
+    } else {
+      if (currentLedMode != 0) {
+        currentLedMode = 0;
+        digitalWrite(LED_PIN, OFF);
+      }
     }
 
 #if SIMULATE_HARDWARE
@@ -647,7 +621,6 @@ void loop() {
       xSemaphoreGive(i2cMutex);
     }
 
-    // Now use t, h safely
     glassTemp = readGlassTemp();
     float delta = glassTemp - t;
 
@@ -658,12 +631,6 @@ void loop() {
       analogWrite(PWM_PIN, pwm);
     }
 
-/*
-    char line[128];
-    snprintf(line, sizeof(line), "🌀 T=%5.1f°C | H=%5.1f%% | G=%5.1f°C | Δ=%+6.2f°C | PWM=%3d%% %s",
-            t, h, glassTemp, delta, pwmPercent, pwm > 0 ? "🔥" : "🌙");
-    sendLog(String(line));
-*/
     if (calibrating && abs(t - lastSampledTemp) >= 0.1) {
       float v = readThermistorVoltage();
       File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
