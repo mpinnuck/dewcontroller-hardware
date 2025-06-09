@@ -233,51 +233,48 @@ void setupWebServer() {
       #main {
         display: flex;
         padding: 10px;
-        flex-direction: row;         /* left to right */
-        align-items: flex-start;     /* top align */
-        gap: 20px;                   /* spacing between status and settings */
-        justify-content: flex-start; /* 👈 stick both to the left */
+        flex-direction: row;
+        align-items: flex-start;
+        gap: 20px;
+        justify-content: flex-start;
       }
 
-      /* prevent flex children from growing */
       #status, #settings {
-        flex: 0 0 auto;              /* 👈 fixed width based on content */
+        flex: 0 0 auto;
       }
 
-      /* Stack vertically on small screens (less than 600px wide) */
       @media (max-width: 600px) {
         #main {
           flex-direction: column;
         }
-
         #status, #settings {
           width: 100%;
         }
       }
 
-        #log {
-          flex-grow: 1; overflow-y: auto;
-          border-top: 1px solid #ccc; background: #f8f8f8;
-          padding: 10px; white-space: pre-wrap;
-          box-sizing: border-box; max-height: calc(100vh - 240px);
-          min-height: 100px; /* Prevent collapse if log is empty */
-        }
+      #log {
+        flex-grow: 1; overflow-y: auto;
+        border-top: 1px solid #ccc; background: #f8f8f8;
+        padding: 10px; white-space: pre-wrap;
+        box-sizing: border-box; max-height: calc(100vh - 240px);
+        min-height: 100px;
+      }
 
-        #controls {
-          display: flex; gap: 10px; padding: 10px;
-        }
+      #controls {
+        display: flex; flex-direction: column; gap: 10px; padding: 10px;
+      }
 
-        .inputrow {
-          display: flex; align-items: center; margin: 5px 0;
-        }
+      .inputrow {
+        display: flex; align-items: center; margin: 5px 0;
+      }
 
-        .inputrow label {
-          width: 150px;
-        }
+      .inputrow label {
+        width: 150px;
+      }
 
-        .inputrow input {
-          flex: 1;
-        }
+      .inputrow input {
+        flex: 1;
+      }
       </style>
 
       <script>
@@ -314,12 +311,21 @@ void setupWebServer() {
 
         function sendPWMValue() {
           const val = document.getElementById("pwmTest").value;
+          const btn = document.getElementById("pwmButton");
+
           fetch("/pwmtest", {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: "pwm=" + val
           }).then(() => {
+            // Toggle button text
+            if (btn.innerText === "Apply") {
+              btn.innerText = "Stop";
+            } else {
+              btn.innerText = "Apply";
+            }
             console.log("PWM test value sent: " + val);
+            setTimeout(updateLog, 300);
           });
         }
 
@@ -332,7 +338,28 @@ void setupWebServer() {
 
         function showCalibration() {
           fetch("/showcal", { method: "POST" })
-            .then(() => setTimeout(updateLog, 300)); // optional short delay to ensure log is flushed
+            .then(() => setTimeout(updateLog, 300));
+        }
+
+        function toggleCalibration() {
+         fetch("/calibrate", { method: "POST" })
+            .then(() => {
+              const btn = document.getElementById("calButton");
+              if (btn.innerText === "Start Calibration") {
+                btn.innerText = "Stop Calibration";
+              } else {
+                btn.innerText = "Start Calibration";
+              }
+              setTimeout(updateLog, 300);
+            });
+        }
+
+        function clearCalibration() {
+          fetch("/clearcal", { method: "POST" })
+            .then(() => {
+              document.getElementById("log").innerText = "🧹 Clearing calibration data.";
+              setTimeout(updateLog, 300);
+            });
         }
 
         setInterval(() => { updateStatus(); updateLog(); }, 3000);
@@ -348,7 +375,7 @@ void setupWebServer() {
             <tr><td>🔍 Glass:</td>         <td><span id='glass'>--</span> °C</td></tr>
             <tr><td>📏 Delta:</td>         <td><span id='delta'>--</span> °C</td></tr>
             <tr id="heaterRow"><td>🔌 Heater:</td> <td><span id='heater'>--</span></td></tr>
-            <tr id="pwmRow"><td>🔥 Heating Power:</td> <td><span id='pwm'>--</span>%</td></tr>            
+            <tr id="pwmRow"><td>🔥 Heating Power:</td> <td><span id='pwm'>--</span>%</td></tr>
           </table>
         </div>
 
@@ -370,7 +397,6 @@ void setupWebServer() {
               <label>Password:</label>
               <input name="password" type="password" value=")rawliteral" + wifiPass + R"rawliteral(">
             </div>
-            <!-- New Timezone input -->
             <div class="inputrow">
               <label>Timezone Offset:</label>
               <input name="timezone" value=")rawliteral" + String(timezoneOffsetHours, 1) + R"rawliteral(">
@@ -382,15 +408,23 @@ void setupWebServer() {
       </div>
 
       <div id="controls">
-        <form action="/toggle" method="POST"><button>Toggle Heater</button></form>
-        <form action="/calibrate" method="POST"><button>Toggle Calibration</button></form>
-        <button type="button" onclick="showCalibration()">Show Calibration</button>
-        <button type="button" onclick="clearLog()">Clear Log</button>
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <label for="pwmTest">🧪 PWM Test:</label>
-          <input type="range" id="pwmTest" min="0" max="100" value="0" oninput="updatePWMValue(this.value)">
-          <span id="pwmValue">0%</span>
-          <button onclick="sendPWMValue()" type="button">Apply</button>
+        <!-- Row 1 -->
+        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+          <form action="/toggle" method="POST"><button>Toggle Heater</button></form>
+          <button id="calButton" type="button" onclick="toggleCalibration()">Start Calibration</button>
+          <button type="button" onclick="showCalibration()">Show Calibration</button>
+          <button type="button" onclick="clearLog()">Clear Log</button>
+        </div>
+
+        <!-- Row 2 -->
+        <div style="display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
+          <button type="button" onclick="clearCalibration()">Clear Calibration Data</button>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <label for="pwmTest">🧪 PWM Test:</label>
+            <input type="range" id="pwmTest" min="0" max="100" value="0" oninput="updatePWMValue(this.value)">
+            <span id="pwmValue">0%</span>
+            <button id="pwmButton" onclick="sendPWMValue()" type="button">Apply</button>
+          </div>
         </div>
       </div>
       <div id="log">Loading...</div>
@@ -498,6 +532,16 @@ void setupWebServer() {
   server.on("/clearlog", HTTP_POST, []() {
     logBuffer = "🧹 Log cleared.\n";
     sendLog("🧹 Log cleared.");
+    server.send(200);
+  });
+
+  server.on("/clearcal", HTTP_POST, []() {
+    if (SPIFFS.exists(CALIBRATION_FILE)) {
+      SPIFFS.remove(CALIBRATION_FILE);
+      sendLog("🧹 Calibration data cleared.");
+    } else {
+      sendLog("ℹ️ No calibration data to clear.");
+    }
     server.send(200);
   });
 
@@ -641,11 +685,6 @@ void loop() {
       }
       lastSampledTemp = t;
       calCount++;
-      if (calCount >= 40) {
-        calibrating = false;
-        sendLog("✅ Calibration STOPPED (40 samples)");
-        computeCalibrationFromCSV();
-      }
     }
   }
 }
