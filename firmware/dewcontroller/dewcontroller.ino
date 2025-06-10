@@ -44,7 +44,7 @@ float   ambientTemp = 0, humidity = 0, glassTemp = 0;
 float   targetDelta = 2.0, humidityThreshold = 80.0;
 float   calibScale = 20.0, calibOffset = 0.0;
 String  wifiSSID = "MicroConcepts-2G";
-String  wifiPass = "leanneannatinka";
+String  wifiPass = "";
 float   timezoneOffsetHours = 10.0;
 bool    heaterEnabled = false, calibrating = false;
 
@@ -688,6 +688,27 @@ unsigned long lastUpdate = 0;
 
 void loop() {
   server.handleClient();
+
+  // ✅ WiFi auto-reconnect logic — runs every loop, not delayed by LOOP_INTERVAL_MS
+  static unsigned long lastReconnectAttempt = 0;
+  static bool wasDisconnected = false;
+
+  if (WiFi.status() != WL_CONNECTED) {
+      if (!wasDisconnected) {
+          sendLog("⚠️ WiFi disconnected, attempting reconnect...");
+          wasDisconnected = true;
+      }
+      if (millis() - lastReconnectAttempt > 10000) {  // every 10 sec
+          lastReconnectAttempt = millis();
+          WiFi.disconnect();
+          WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+      }
+  } else {
+      if (wasDisconnected) {
+          sendLog("✅ WiFi reconnected: " + WiFi.localIP().toString());
+          wasDisconnected = false;
+      }
+  }
 
   if (millis() - lastUpdate >= LOOP_INTERVAL_MS) {
     lastUpdate = millis();
