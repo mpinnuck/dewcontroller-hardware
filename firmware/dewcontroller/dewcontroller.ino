@@ -6,8 +6,10 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+#include "esp_log.h"
 #include <time.h>
 
+#define DEVICE_VERSION "v1.0.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -37,6 +39,7 @@ WebServer           server(80);
 TwoWire I2CBus = TwoWire(1);  // Dedicated I2C bus
 Adafruit_AHTX0      aht;
 
+// status and config variables
 float   ambientTemp = 0, humidity = 0, glassTemp = 0;
 float   targetDelta = 2.0, humidityThreshold = 80.0;
 float   calibScale = 20.0, calibOffset = 0.0;
@@ -44,12 +47,42 @@ String  wifiSSID = "MicroConcepts-2G";
 String  wifiPass = "leanneannatinka";
 float   timezoneOffsetHours = 10.0;
 bool    heaterEnabled = false, calibrating = false;
+
+// calibration variables
 float   lastSampledTemp = -100.0;
 int     calCount = 0, pwm = 0;
-bool pwmTest = false;
+bool    pwmTest = false;
+const unsigned long CAL_SAMPLE_INTERVAL_MS = 30000;  // 30 seconds
+unsigned long lastCalSampleTime = 0;
+bool    firstCalSample = true;  // For adding header line
 
+const int MAX_LOG_SIZE = 32768;
 String  logBuffer;
-const int MAX_LOG_SIZE = 4096;
+
+String getStorageUsedSummary() {
+    size_t total = SPIFFS.totalBytes();
+    size_t used = SPIFFS.usedBytes();
+
+    float usedKB = used / 1024.0;
+    float totalKB = total / 1024.0;
+
+    return String(usedKB, 1) + "/" + String(totalKB, 1) + " KB";
+}
+
+String getCalibrationFileSizeKB(const char* filename) {
+    if (!SPIFFS.exists(filename)) {
+        return "0 KB";
+    }
+    File f = SPIFFS.open(filename, FILE_READ);
+    size_t size = f.size();
+    f.close();
+    float sizeKB = size / 1024.0;
+    String result = String(sizeKB, 1) + " KB";
+    if (sizeKB > 200.0) {
+        result += " ⚠️";
+    }
+    return result;
+}
 
 void sendLog(const String& msg) {
   DEBUG_PRINT(msg);
@@ -170,6 +203,10 @@ void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("DewController");
   WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  WiFi.setSleep(false);    // helps with stable WiFi
+  #if DEBUG_MODE
+    esp_log_level_set("*", ESP_LOG_ERROR);   // Suppress WiFi verbose logs
+  #endif
 
   int maxRetries = 10;
   int retries = 0;
@@ -258,6 +295,8 @@ void setupWebServer() {
         padding: 10px; white-space: pre-wrap;
         box-sizing: border-box; max-height: calc(100vh - 240px);
         min-height: 100px;
+        font-family: monospace;
+        font-size: 0.9rem;
       }
 
       #controls {
@@ -292,8 +331,20 @@ void setupWebServer() {
             const pwmVal = parseInt(data.pwm);
             const pwmSpan = document.getElementById("pwm");
             const pwmRow = document.getElementById("pwmRow");
-            pwmSpan.innerText = pwmVal + "%";
+            pwmSpan.innerText = pwmVal;
             pwmRow.style.backgroundColor = pwmVal > 0 ? "#c0ffc0" : "transparent";
+            document.getElementById("calibrationFileSize").innerText = data.calibrationFileSize;
+            document.getElementById("storageInfo").innerText = data.storageInfo;
+            document.getElementById("version").innerText = " " + data.version;
+
+            // 👉 handle calibrating status → update calButton text:
+            const calButton = document.getElementById("calButton");
+            if (data.calibrating) {
+              calButton.innerText = "Stop Calibration";
+            } else {
+              calButton.innerText = "Start Calibration";
+            }
+
           });
         }
 
@@ -366,7 +417,10 @@ void setupWebServer() {
         window.onload = () => { updateStatus(); updateLog(); };
       </script>
       </head><body>
-      <h2 style="padding:10px">Dew Heater Controller</h2>
+      <h2 style="padding:10px">
+        Dew Heater Controller 
+        <span id="version" style="font-size: 0.6em; color: #666;"></span>
+      </h2>
       <div id="main">
         <div id="status">
           <table style="font-family: monospace; font-size: 1rem;">
@@ -376,6 +430,8 @@ void setupWebServer() {
             <tr><td>📏 Delta:</td>         <td><span id='delta'>--</span> °C</td></tr>
             <tr id="heaterRow"><td>🔌 Heater:</td> <td><span id='heater'>--</span></td></tr>
             <tr id="pwmRow"><td>🔥 Heating Power:</td> <td><span id='pwm'>--</span>%</td></tr>
+            <tr><td>🗂 Calibration File:</td> <td><span id='calibrationFileSize'>--</span></td></tr>
+            <tr><td>💾 Storage Used:</td> <td><span id='storageInfo'>--</span></td></tr>
           </table>
         </div>
 
@@ -449,19 +505,24 @@ void setupWebServer() {
     float delta = glassTemp - t;
     int pwmPercent = pwm * 100 / 255;
 
-    String json = "{";
-    json += "\"ambient\":" + String(t, 1) + ",";
-    json += "\"humidity\":" + String(h, 1) + ",";
-    json += "\"glass\":" + String(glassTemp, 1) + ",";
-    json += "\"delta\":" + String(delta, 2) + ",";
-    json += "\"heater\":" + String(heaterEnabled ? "true" : "false") + ",";
-    json += "\"pwm\":" + String(pwmPercent);
-    json += "}";
+    StaticJsonDocument<256> doc;
+    doc["ambient"] = String(t, 1);
+    doc["humidity"] = String(h, 1);
+    doc["glass"] = String(glassTemp, 1);
+    doc["delta"] = String(delta, 1);
+    doc["heater"] = heaterEnabled;  // already boolean → no change
+    doc["pwm"] = pwmPercent;        // already integer or float → ok as is
+    doc["calibrating"] = calibrating;
+    doc["calibrationFileSize"] = getCalibrationFileSizeKB(CALIBRATION_FILE);
+    doc["storageInfo"] = getStorageUsedSummary();
+    doc["version"] = DEVICE_VERSION;
 
+    String json;
+    serializeJson(doc, json);
     server.send(200, "application/json; charset=UTF-8", json);
   });
 
-    server.on("/log", []() {
+  server.on("/log", []() {
     server.send(200, "text/plain", logBuffer);
   });
 
@@ -474,13 +535,19 @@ void setupWebServer() {
   });
 
   server.on("/calibrate", HTTP_POST, []() {
-    calibrating = !calibrating;
-    lastSampledTemp = -100.0;
-    sendLog(calibrating ? "🧪 Calibration STARTED" : "✅ Calibration STOPPED");
-    if (!calibrating) computeCalibrationFromCSV();
-    saveConfig();
-    server.sendHeader("Location", "/");
-    server.send(303);
+      calibrating = !calibrating;
+      lastSampledTemp = -100.0;
+      lastCalSampleTime = 0;
+      calCount = 0;
+      firstCalSample = true;
+
+      if (calibrating) {
+        sendLog("🧪 Calibration STARTED — sampling every 30 sec: [time, ambient, V, PWM %]");
+      } else {
+        sendLog("✅ Calibration STOPPED");
+        computeCalibrationFromCSV();
+      }
+      server.send(200);
   });
 
   server.on("/settings", HTTP_POST, []() {
@@ -531,7 +598,6 @@ void setupWebServer() {
 
   server.on("/clearlog", HTTP_POST, []() {
     logBuffer = "🧹 Log cleared.\n";
-    sendLog("🧹 Log cleared.");
     server.send(200);
   });
 
@@ -592,9 +658,10 @@ void sensorTask(void* parameter) {
 // Setup controller
 void setup() {
   logBuffer = "";
-#if DEBUG_MODE
+#if DEBUG_MODE 
   Serial.begin(115200);
   delay(1200);
+  DEBUG_PRINT("🔍 Serial started at 115200 baud");
 #endif
 
   sendLog("🚀 Sketch started");
@@ -675,16 +742,41 @@ void loop() {
       analogWrite(PWM_PIN, pwm);
     }
 
-    if (calibrating && abs(t - lastSampledTemp) >= 0.1) {
-      float v = readThermistorVoltage();
-      File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
-      if (f) {
-        f.printf("%.2f,%.3f\n", t, v);
-        f.close();
-        sendLog("📌 Sample " + String(calCount + 1) + ": T=" + String(t, 2) + " V=" + String(v, 3));
-      }
-      lastSampledTemp = t;
-      calCount++;
+    if (calibrating && (millis() - lastCalSampleTime >= CAL_SAMPLE_INTERVAL_MS)) {
+        lastCalSampleTime = millis();
+
+        float v = readThermistorVoltage();
+        float tAmbient = 0.0;
+
+        // thread safe read of sensor data
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+          tAmbient = ambientTemp;
+          xSemaphoreGive(i2cMutex);
+        } else {
+          tAmbient = ambientTemp;
+        }
+
+        // Get current time
+        struct tm timeinfo;
+        char timeStr[32] = "??";
+        if (getLocalTime(&timeinfo)) {
+          strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        }
+
+        // Write to CSV
+        File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
+        if (f) {
+          if (firstCalSample) {
+            f.println("Time,Ambient_T,V_Thermistor,PWM%");
+            firstCalSample = false;
+          }
+          f.printf("%s,%.2f,%.3f,%d\n", timeStr, tAmbient, v, pwm * 100 / 255);
+          f.close();
+          sendLog(String(calCount + 1) + ": " + timeStr + " " + String(tAmbient, 2) + " " + String(v, 3) + " " + String(pwm * 100 / 255));
+        } else {
+          sendLog("❌ Could not open calibration file for writing.");
+        }
+        calCount++;
     }
   }
 }
