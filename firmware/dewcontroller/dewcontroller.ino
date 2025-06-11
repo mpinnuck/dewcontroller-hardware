@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <Adafruit_SHT4x.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -8,14 +9,17 @@
 #include <ESPmDNS.h>
 #include "esp_log.h"
 #include <time.h>
+#include <HTTPClient.h>
 
-#define DEVICE_VERSION "v1.0.0"
+#define USE_SENSOR_SHT40 0  // set to 1 for SHT40, 0 for AHT20
+#define DEVICE_VERSION "v2.0.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
 #define CONFIG_FILE "/config.json"
 #define CALIBRATION_FILE "/calibration.csv"
 #define LOOP_INTERVAL_MS 2000
+#define WEATHER_POLL_INTERVAL_MS 5 * 60 * 1000 //300000 ms or 5 minutes
 
 #define I2C_SDA 5
 #define I2C_SCL 6
@@ -31,13 +35,22 @@
   #define DEBUG_PRINT(x) do {} while (0)
 #endif
 
+enum SensorSource {
+  SOURCE_AHT20,
+  SOURCE_SHT40,
+  SOURCE_WEATHER
+};
+SensorSource sensorSource = SOURCE_WEATHER;  // Default = weather station
+
 SemaphoreHandle_t   i2cMutex;
+
 TaskHandle_t        sensorTaskHandle;
 
 WebServer           server(80);
 
 TwoWire I2CBus = TwoWire(1);  // Dedicated I2C bus
 Adafruit_AHTX0      aht;
+Adafruit_SHT4x      sht4;
 
 // status and config variables
 float   ambientTemp = 0, humidity = 0, glassTemp = 0;
@@ -82,6 +95,61 @@ String getCalibrationFileSizeKB(const char* filename) {
         result += " ⚠️";
     }
     return result;
+}
+
+// adjust your weather API URL
+const char* WEATHER_API_URL = "https://api.weather.com/v2/pws/observations/current?stationId=ISYDNEY478&format=json&units=m&apiKey=5356e369de454c6f96e369de450c6f22";
+
+bool fetchOutdoorWeather(float* outTemp, float* outHumidity) {
+  HTTPClient http;
+  http.begin(WEATHER_API_URL);
+
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+
+    // TEMP LOG
+    //sendLog("📡 Weather raw JSON: " + payload);
+
+    StaticJsonDocument<2048> doc;
+    DeserializationError err = deserializeJson(doc, payload);
+
+    if (err) {
+      sendLog("❌ JSON parse error: " + String(err.c_str()));
+      http.end();
+      return false;
+    }
+
+    JsonObject obsRoot = doc["observations"][0];
+    JsonObject metric = obsRoot["metric"];
+
+    if (obsRoot.isNull() || metric.isNull()) {
+      sendLog("❌ Weather API missing required data.");
+      http.end();
+      return false;
+    }
+
+    float temp = metric["temp"] | NAN;
+    float humidity = obsRoot["humidity"] | NAN;  // FIXED
+
+    // Log extracted values
+    sendLog("📡 Extracted temp=" + String(temp) + ", humidity=" + String(humidity));
+
+    if (!isnan(temp) && !isnan(humidity)) {
+      *outTemp = temp;
+      *outHumidity = humidity;
+      http.end();
+      return true;
+    } else {
+      sendLog("❌ Weather API returned invalid values.");
+      http.end();
+      return false;
+    }
+  } else {
+    sendLog("❌ Weather API HTTP error: " + String(httpCode));
+    http.end();
+    return false;
+  }
 }
 
 void sendLog(const String& msg) {
@@ -317,6 +385,8 @@ void setupWebServer() {
       </style>
 
       <script>
+        let logPaused = false;
+
         function updateStatus() {
           fetch('/status.json').then(r => r.json()).then(data => {
             document.getElementById("ambient").innerText = data.ambient;
@@ -346,6 +416,11 @@ void setupWebServer() {
             }
 
           });
+        }
+
+        function toggleHeater() {
+          fetch("/toggle", { method: "POST" })
+            .then(() => setTimeout(updateLog, 300));
         }
 
         function updateLog() {
@@ -413,8 +488,23 @@ void setupWebServer() {
             });
         }
 
-        setInterval(() => { updateStatus(); updateLog(); }, 3000);
+        function toggleLogPause() {
+          logPaused = !logPaused;
+          const btn = document.getElementById("pauseLogButton");
+          btn.innerText = logPaused ? "Resume Log" : "Pause Log";
+        }
+
+        function downloadCalibration() {
+          window.location.href = "/downloadcal";
+        }
+
+        setInterval(() => { 
+          updateStatus();
+          if (!logPaused) updateLog();
+        }, 3000);
+
         window.onload = () => { updateStatus(); updateLog(); };
+
       </script>
       </head><body>
       <h2 style="padding:10px">
@@ -466,10 +556,12 @@ void setupWebServer() {
       <div id="controls">
         <!-- Row 1 -->
         <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-          <form action="/toggle" method="POST"><button>Toggle Heater</button></form>
+          <button type="button" onclick="toggleHeater()">Toggle Heater</button>
           <button id="calButton" type="button" onclick="toggleCalibration()">Start Calibration</button>
           <button type="button" onclick="showCalibration()">Show Calibration</button>
           <button type="button" onclick="clearLog()">Clear Log</button>
+          <button id="pauseLogButton" type="button" onclick="toggleLogPause()">Pause Log</button>
+          <button type="button" onclick="downloadCalibration()">Download Calibration CSV</button>
         </div>
 
         <!-- Row 2 -->
@@ -611,26 +703,62 @@ void setupWebServer() {
     server.send(200);
   });
 
+  server.on("/downloadcal", HTTP_GET, []() {
+      if (SPIFFS.exists(CALIBRATION_FILE)) {
+          File f = SPIFFS.open(CALIBRATION_FILE, FILE_READ);
+          server.streamFile(f, "text/csv");
+          f.close();
+      } else {
+          server.send(404, "text/plain", "Calibration file not found");
+      }
+  });
+
   server.begin();
   sendLog("🌐 Web server started");
 }
 
-// I2C sensorTask()
-void sensorTask(void* parameter) {
-  sendLog("🧵 Sensor task started on core " + String(xPortGetCoreID()));
+void weatherTask(void* parameter) {
+  sendLog("🧵 Weather task started on core " + String(xPortGetCoreID()));
+
+  float outTemp = NAN, outHumidity = NAN;
+
+  // No initial fetch here — loop will do first fetch
+
+  for (;;) {
+    if (sensorSource == SOURCE_WEATHER) {
+      bool ok = fetchOutdoorWeather(&outTemp, &outHumidity);
+
+      if (ok) {
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+          ambientTemp = outTemp;
+          humidity = outHumidity;
+          xSemaphoreGive(i2cMutex);
+        }
+        sendLog("🌤 Weather updated: " + String(outTemp,1) + "°C, " + String(outHumidity,1) + "%");
+      } else {
+        sendLog("⚠️ Weather fetch failed.");
+      }
+    }
+
+    delay(5 * 60 * 1000);  // 5 min delay
+  }
+}
+
+// Sensor task for AHT20
+void sensorTask_AHT20(void* parameter) {
+  sendLog("🧵 Sensor task (AHT20) started on core " + String(xPortGetCoreID()));
   sendLog("🧪 SDA = " + String(I2C_SDA) + ", SCL = " + String(I2C_SCL));
-  sendLog("🧪 Using I2C bus: 1");
 
   I2CBus.begin(I2C_SDA, I2C_SCL);
   delay(10);
 
   if (!aht.begin(&I2CBus)) {
-    sendLog("❌ AHT20 init failed (dedicated bus)");
+    sendLog("❌ AHT20 init failed");
     vTaskDelete(NULL);
     return;
   }
 
-  sendLog("✅ AHT20 initialized (dedicated bus)");
+  sendLog("✅ AHT20 initialized");
 
   for (;;) {
     sensors_event_t h, t;
@@ -655,6 +783,45 @@ void sensorTask(void* parameter) {
   }
 }
 
+// Sensor task for SHT40
+void sensorTask_SHT40(void* parameter) {
+  sendLog("🧵 Sensor task (SHT40) started on core " + String(xPortGetCoreID()));
+  sendLog("🧪 SDA = " + String(I2C_SDA) + ", SCL = " + String(I2C_SCL));
+
+  I2CBus.begin(I2C_SDA, I2C_SCL);
+  delay(10);
+
+  if (!sht4.begin(&I2CBus)) {
+    sendLog("❌ SHT40 init failed");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  sendLog("✅ SHT40 initialized");
+
+  // Optional settings
+  sht4.setPrecision(SHT4X_HIGH_PRECISION);
+  sht4.setHeater(SHT4X_NO_HEATER);
+
+  for (;;) {
+    sensors_event_t humidity_event, temp_event;
+    sht4.getEvent(&humidity_event, &temp_event);  // Read both values
+
+    if (!isnan(temp_event.temperature) && !isnan(humidity_event.relative_humidity)) {
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+        ambientTemp = temp_event.temperature;
+        humidity = humidity_event.relative_humidity;
+        xSemaphoreGive(i2cMutex);
+      }
+    } else {
+      sendLog("⚠️ SHT40 returned bad data");
+    }
+
+    delay(2000);
+  }
+}
+
+
 // Setup controller
 void setup() {
   logBuffer = "";
@@ -676,10 +843,18 @@ void setup() {
   setupWebServer();
 
   i2cMutex = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCore(
-    sensorTask, "SensorTask", 4096, NULL, 1, &sensorTaskHandle, 1
-  );
+  if (sensorSource == SOURCE_SHT40) {
+    xTaskCreatePinnedToCore(sensorTask_SHT40, "SensorTask_SHT40", 4096, NULL, 1, &sensorTaskHandle, 1);
+    sendLog("📡 Using SHT40 sensor");
 
+  } else if (sensorSource == SOURCE_WEATHER) {
+    xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 1);  // run on core 1
+    sendLog("📡 Using Weather station");
+
+  } else {  // SOURCE_AHT20
+    xTaskCreatePinnedToCore(sensorTask_AHT20, "SensorTask_AHT20", 4096, NULL, 1, &sensorTaskHandle, 1);
+    sendLog("📡 Using AHT20 sensor");
+  }
   delay(500);
 }
 
@@ -764,40 +939,45 @@ void loop() {
     }
 
     if (calibrating && (millis() - lastCalSampleTime >= CAL_SAMPLE_INTERVAL_MS)) {
-        lastCalSampleTime = millis();
+      lastCalSampleTime = millis();
 
-        float v = readThermistorVoltage();
-        float tAmbient = 0.0;
+      float v = readThermistorVoltage();
+      float tAmbient = 0.0;
 
-        // thread safe read of sensor data
-        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+      // Thread-safe read of ambientTemp
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
           tAmbient = ambientTemp;
           xSemaphoreGive(i2cMutex);
-        } else {
+      } else {
           tAmbient = ambientTemp;
-        }
+      }
 
-        // Get current time
-        struct tm timeinfo;
-        char timeStr[32] = "??";
-        if (getLocalTime(&timeinfo)) {
+      // Get current time
+      struct tm timeinfo;
+      char timeStr[32] = "??";
+      if (getLocalTime(&timeinfo)) {
           strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-        }
+      }
 
-        // Write to CSV
-        File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
-        if (f) {
+      // Write to CSV
+      File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
+      if (f) {
           if (firstCalSample) {
-            f.println("Time,Ambient_T,V_Thermistor,PWM%");
-            firstCalSample = false;
+              f.println("Time,Ambient_T,V_Thermistor,PWM%");
+              firstCalSample = false;
           }
           f.printf("%s,%.2f,%.3f,%d\n", timeStr, tAmbient, v, pwm * 100 / 255);
           f.close();
-          sendLog(String(calCount + 1) + ": " + timeStr + " " + String(tAmbient, 2) + " " + String(v, 3) + " " + String(pwm * 100 / 255));
-        } else {
+
+          sendLog(String(calCount + 1) + ": " + timeStr + " "
+                  + String(tAmbient, 2) + "C "
+                  + String(v, 3) + "V "
+                  + String(pwm * 100 / 255) + "%");
+      } else {
           sendLog("❌ Could not open calibration file for writing.");
-        }
-        calCount++;
+      }
+
+      calCount++;
     }
   }
 }
