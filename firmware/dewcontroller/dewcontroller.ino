@@ -11,7 +11,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 
-#define DEVICE_VERSION "v2.1.0"
+#define DEVICE_VERSION "v2.2.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -54,7 +54,9 @@ Adafruit_SHT4x      sht4;
 // status and config variables
 float   ambientTemp = 0, humidity = 0, glassTemp = 0;
 float   targetDelta = 2.0, humidityThreshold = 80.0;
-float   calibScale = 20.0, calibOffset = 0.0;
+float glassCoeffC = 131.5;
+float glassCoeffB = -111.7;
+float glassCoeffA = 23.3;
 String  wifiSSID = "MicroConcepts-2G";
 String  wifiPass = "";
 float   timezoneOffsetHours = 10.0;
@@ -163,8 +165,9 @@ void saveConfig() {
   StaticJsonDocument<512> doc;
   doc["delta"] = targetDelta;
   doc["humidity"] = humidityThreshold;
-  doc["scale"] = calibScale;
-  doc["offset"] = calibOffset;
+  doc["glassCoeffC"] = glassCoeffC;
+  doc["glassCoeffB"] = glassCoeffB;
+  doc["glassCoeffA"] = glassCoeffA;
   doc["heater"] = heaterEnabled;
   doc["ssid"] = wifiSSID;
   doc["password"] = wifiPass;
@@ -203,8 +206,9 @@ void loadConfig() {
   // Assign values
   targetDelta         = doc["delta"]       | 2.0;
   humidityThreshold   = doc["humidity"]    | 80.0;
-  calibScale          = doc["scale"]       | 20.0;
-  calibOffset         = doc["offset"]      | 0.0;
+  glassCoeffC         = doc["glassCoeffC"] | 131.5;
+  glassCoeffB         = doc["glassCoeffB"] | -111.7;
+  glassCoeffA         = doc["glassCoeffA"] | 23.3;
   heaterEnabled       = doc["heater"]      | false;
   wifiSSID            = doc["ssid"]        | "MicroConcepts-2G";
   wifiPass            = doc["password"]    | "leanneannatinka";
@@ -217,7 +221,10 @@ void loadConfig() {
   sendLog("📦 WiFi SSID: " + wifiSSID);
   // sendLog("📦 WiFi Password: " + wifiPass);  // Do NOT log password
   sendLog(String("📦 Timezone Offset: UTC") + (timezoneOffsetHours >= 0 ? "+" : "") + String(timezoneOffsetHours, 1));
-  sendLog("📦 T = " + String(calibScale, 2) + " × V + " + String(calibOffset, 2));
+  sendLog("📦 T_glass = T_ambient + "
+        + String(glassCoeffC,1) + " + ("
+        + String(glassCoeffB,1) + "·V) + ("
+        + String(glassCoeffA,1) + "·V²)");
 }
 
 float readThermistorVoltage() {
@@ -225,40 +232,20 @@ float readThermistorVoltage() {
 }
 
 float readGlassTemp() {
-  return readThermistorVoltage() * calibScale + calibOffset;
+  float V = readThermistorVoltage();
+  float tAmbient;
+
+  // Thread-safe read of ambientTemp:
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+      tAmbient = ambientTemp;
+      xSemaphoreGive(i2cMutex);
+  } else {
+      tAmbient = ambientTemp;
+  }
+
+  return tAmbient + glassCoeffC + glassCoeffB * V + glassCoeffA * V * V;
 }
 
-void computeCalibrationFromCSV() {
-  File f = SPIFFS.open(CALIBRATION_FILE, FILE_READ);
-  if (!f) return;
-
-  String line = f.readStringUntil('\n');  // skip header
-  float sumT = 0, sumV = 0, sumTV = 0, sumV2 = 0;
-  int n = 0;
-  while (f.available()) {
-    line = f.readStringUntil('\n');
-    int comma = line.indexOf(',');
-    if (comma < 0) continue;
-    float T = line.substring(0, comma).toFloat();
-    float V = line.substring(comma + 1).toFloat();
-    sumT += T;
-    sumV += V;
-    sumTV += T * V;
-    sumV2 += V * V;
-    ++n;
-  }
-  f.close();
-
-  if (n >= 2) {
-    float denom = n * sumV2 - sumV * sumV;
-    if (denom != 0) {
-      calibScale = (n * sumTV - sumT * sumV) / denom;
-      calibOffset = (sumT - calibScale * sumV) / n;
-      sendLog("📐 T = " + String(calibScale, 3) + " × V + " + String(calibOffset, 3));
-      saveConfig();
-    }
-  }
-}
 
 void setupWiFi() {
   pinMode(LED_PIN, OUTPUT);
@@ -563,7 +550,10 @@ void setupWebServer() {
             </div>
             <button type="submit">Update Settings</button>
           </form>
-          <p>Calibration: T = )rawliteral" + String(calibScale, 2) + R"rawliteral( × V + )rawliteral" + String(calibOffset, 2) + R"rawliteral(</p>
+          <p> T_glass = T_ambient + )rawliteral" 
+                      + String(glassCoeffC,1) + R"rawliteral( + ()rawliteral"
+                      + String(glassCoeffB,1) + R"rawliteral(·V + ()rawliteral"
+                      + String(glassCoeffA,1) + R"rawliteral(·V²)</p>
         </div>
       </div>
 
@@ -656,7 +646,6 @@ void setupWebServer() {
         sendLog("🧪 Calibration STARTED — sampling every 30 sec: [time, ambient, V, PWM %]");
       } else {
         sendLog("✅ Calibration STOPPED");
-        computeCalibrationFromCSV();
       }
       server.send(200);
   });
@@ -840,6 +829,164 @@ void sensorTask_SHT40(void* parameter) {
   }
 }
 
+void handleWiFiReconnect() {
+    static unsigned long lastReconnectAttempt = 0;
+    static bool wasDisconnected = false;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        if (!wasDisconnected) {
+            sendLog("⚠️ WiFi disconnected, attempting reconnect...");
+            wasDisconnected = true;
+        }
+        if (millis() - lastReconnectAttempt > 10000) {
+            lastReconnectAttempt = millis();
+            WiFi.disconnect();
+            WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+        }
+    } else {
+        if (wasDisconnected) {
+            sendLog("✅ WiFi reconnected: " + WiFi.localIP().toString());
+            wasDisconnected = false;
+        }
+    }
+}
+
+void handleLEDStatus() {
+    static unsigned long lastLED = 0;
+    static bool ledState = false;
+    static int currentLedMode = -1;
+
+    if (WiFi.getMode() == WIFI_AP) {
+        if (currentLedMode != 2) {
+            currentLedMode = 2;
+            lastLED = millis();
+            ledState = false;
+            digitalWrite(LED_PIN, ledState);
+        }
+        if (millis() - lastLED > 500) {
+            lastLED = millis();
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+        }
+    } else if (WiFi.status() == WL_CONNECTED) {
+        if (currentLedMode != 1) {
+            currentLedMode = 1;
+            digitalWrite(LED_PIN, ON);
+        }
+    } else {
+        if (currentLedMode != 0) {
+            currentLedMode = 0;
+            digitalWrite(LED_PIN, OFF);
+        }
+    }
+}
+
+void simulateHardware() {
+    ambientTemp = 17.0 + sin(millis() / 12000.0);
+    humidity = 78.0 + sin(millis() / 8000.0);
+}
+
+void updateGlassTemp() {
+    float t, h;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+        t = ambientTemp;
+        h = humidity;
+        xSemaphoreGive(i2cMutex);
+    }
+
+    glassTemp = readGlassTemp();
+}
+
+void updateHeaterControl() {
+    // If manual PWM test is active → do nothing
+    if (pwmTest) {
+        return;
+    }
+
+    // If heater is OFF → do nothing
+    if (!heaterEnabled) {
+        pwm = 0;
+        analogWrite(PWM_PIN, pwm);
+        return;
+    }
+
+    // If heater is ON and not in test mode → proceed
+    float t;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+        t = ambientTemp;
+        xSemaphoreGive(i2cMutex);
+    } else {
+        t = ambientTemp;
+    }
+
+    float delta = glassTemp - t;
+
+    // Simple control constants
+    const float Kp = 50.0;         // Proportional gain → tune this
+    const int PWM_MIN = 64;        // Minimum PWM when heating needed
+    const int PWM_MAX = 255;       // Max PWM
+    const int PWM_HOLD = 64;       // PWM to maintain delta at target
+
+    if (humidity >= humidityThreshold) {
+        // Automatic control active
+        if (delta < targetDelta) {
+            float error = targetDelta - delta;
+            int pwmValue = constrain(int(Kp * error), PWM_MIN, PWM_MAX);
+            pwm = pwmValue;
+        } else {
+            // Target reached → hold PWM at low level to prevent oscillation
+            pwm = PWM_HOLD;
+        }
+    } else {
+        // Humidity below threshold → force off PWM
+        pwm = 0;
+    }
+
+    analogWrite(PWM_PIN, pwm);
+}
+
+void updateCalibrationSampling() {
+    if (calibrating && (millis() - lastCalSampleTime >= CAL_SAMPLE_INTERVAL_MS)) {
+        lastCalSampleTime = millis();
+
+        float v = readThermistorVoltage();
+        float tAmbient = 0.0;
+
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+            tAmbient = ambientTemp;
+            xSemaphoreGive(i2cMutex);
+        } else {
+            tAmbient = ambientTemp;
+        }
+
+        struct tm timeinfo;
+        char timeStr[32] = "??";
+        if (getLocalTime(&timeinfo)) {
+            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        }
+
+        File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
+        if (f) {
+            if (firstCalSample) {
+                f.println("Time,Ambient_T,V_Thermistor,PWM%");
+                firstCalSample = false;
+            }
+            f.printf("%s,%.2f,%.3f,%d\n", timeStr, tAmbient, v, pwm * 100 / 255);
+            f.close();
+
+            sendLog(String(calCount + 1) + ": " + timeStr + " "
+                    + String(tAmbient, 2) + "C "
+                    + String(v, 3) + "V "
+                    + String(pwm * 100 / 255) + "%");
+        } else {
+            sendLog("❌ Could not open calibration file for writing.");
+        }
+
+        calCount++;
+    }
+}
+
+
 
 // Setup controller
 void setup() {
@@ -881,122 +1028,18 @@ void setup() {
 unsigned long lastUpdate = 0;
 
 void loop() {
-  server.handleClient();
+    server.handleClient();
+    handleWiFiReconnect();
+    handleLEDStatus();
 
-  // ✅ WiFi auto-reconnect logic — runs every loop, not delayed by LOOP_INTERVAL_MS
-  static unsigned long lastReconnectAttempt = 0;
-  static bool wasDisconnected = false;
-
-  if (WiFi.status() != WL_CONNECTED) {
-      if (!wasDisconnected) {
-          sendLog("⚠️ WiFi disconnected, attempting reconnect...");
-          wasDisconnected = true;
-      }
-      if (millis() - lastReconnectAttempt > 10000) {  // every 10 sec
-          lastReconnectAttempt = millis();
-          WiFi.disconnect();
-          WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-      }
-  } else {
-      if (wasDisconnected) {
-          sendLog("✅ WiFi reconnected: " + WiFi.localIP().toString());
-          wasDisconnected = false;
-      }
-  }
-
-  if (millis() - lastUpdate >= LOOP_INTERVAL_MS) {
-    lastUpdate = millis();
-
-    static unsigned long lastLED = 0;
-    static bool ledState = false;
-    static int currentLedMode = -1;
-
-    if (WiFi.getMode() == WIFI_AP) {
-      if (currentLedMode != 2) {
-        currentLedMode = 2;
-        lastLED = millis();
-        ledState = false;
-        digitalWrite(LED_PIN, ledState);
-      }
-      if (millis() - lastLED > 500) {
-        lastLED = millis();
-        ledState = !ledState;
-        digitalWrite(LED_PIN, ledState);
-      }
-    } else if (WiFi.status() == WL_CONNECTED) {
-      if (currentLedMode != 1) {
-        currentLedMode = 1;
-        digitalWrite(LED_PIN, ON);
-      }
-    } else {
-      if (currentLedMode != 0) {
-        currentLedMode = 0;
-        digitalWrite(LED_PIN, OFF);
-      }
-    }
+    if (millis() - lastUpdate >= LOOP_INTERVAL_MS) {
+        lastUpdate = millis();
 
 #if SIMULATE_HARDWARE
-    ambientTemp = 17.0 + sin(millis() / 12000.0);
-    humidity = 78.0 + sin(millis() / 8000.0);
+        simulateHardware();
 #endif
-
-    float t, h;
-    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-      t = ambientTemp;
-      h = humidity;
-      xSemaphoreGive(i2cMutex);
+        updateGlassTemp();
+        updateHeaterControl();
+        updateCalibrationSampling();
     }
-
-    glassTemp = readGlassTemp();
-    float delta = glassTemp - t;
-
-    if (!pwmTest) {
-      pwm = (heaterEnabled && humidity >= humidityThreshold && delta < targetDelta)
-            ? map(constrain(targetDelta - delta, 0, 5), 0, 5, 64, 255)
-            : 0;
-      analogWrite(PWM_PIN, pwm);
-    }
-
-    if (calibrating && (millis() - lastCalSampleTime >= CAL_SAMPLE_INTERVAL_MS)) {
-      lastCalSampleTime = millis();
-
-      float v = readThermistorVoltage();
-      float tAmbient = 0.0;
-
-      // Thread-safe read of ambientTemp
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-          tAmbient = ambientTemp;
-          xSemaphoreGive(i2cMutex);
-      } else {
-          tAmbient = ambientTemp;
-      }
-
-      // Get current time
-      struct tm timeinfo;
-      char timeStr[32] = "??";
-      if (getLocalTime(&timeinfo)) {
-          strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-      }
-
-      // Write to CSV
-      File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
-      if (f) {
-          if (firstCalSample) {
-              f.println("Time,Ambient_T,V_Thermistor,PWM%");
-              firstCalSample = false;
-          }
-          f.printf("%s,%.2f,%.3f,%d\n", timeStr, tAmbient, v, pwm * 100 / 255);
-          f.close();
-
-          sendLog(String(calCount + 1) + ": " + timeStr + " "
-                  + String(tAmbient, 2) + "C "
-                  + String(v, 3) + "V "
-                  + String(pwm * 100 / 255) + "%");
-      } else {
-          sendLog("❌ Could not open calibration file for writing.");
-      }
-
-      calCount++;
-    }
-  }
 }
