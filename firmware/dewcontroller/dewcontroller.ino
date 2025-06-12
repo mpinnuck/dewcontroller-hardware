@@ -11,8 +11,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 
-#define USE_SENSOR_SHT40 0  // set to 1 for SHT40, 0 for AHT20
-#define DEVICE_VERSION "v2.0.0"
+#define DEVICE_VERSION "v2.1.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -415,12 +414,27 @@ void setupWebServer() {
               calButton.innerText = "Start Calibration";
             }
 
+            // 👉 handle heater status → update heater button text:
+            const heaterButton = document.getElementById("heaterButton");
+            if (heaterOn) {
+              heaterButton.innerText = "Turn Heater OFF";
+            } else {
+              heaterButton.innerText = "Turn Heater ON";
+            }
           });
         }
 
         function toggleHeater() {
           fetch("/toggle", { method: "POST" })
-            .then(() => setTimeout(updateLog, 300));
+            .then(() => {
+              const btn = document.getElementById("heaterButton");
+              if (btn.innerText === "Turn Heater ON") {
+                btn.innerText = "Turn Heater OFF";
+              } else {
+                btn.innerText = "Turn Heater ON";
+              }
+              setTimeout(updateLog, 300);
+            });
         }
 
         function updateLog() {
@@ -556,7 +570,7 @@ void setupWebServer() {
       <div id="controls">
         <!-- Row 1 -->
         <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-          <button type="button" onclick="toggleHeater()">Toggle Heater</button>
+          <button id="heaterButton" type="button" onclick="toggleHeater()">Turn Heater ON</button>
           <button id="calButton" type="button" onclick="toggleCalibration()">Start Calibration</button>
           <button type="button" onclick="showCalibration()">Show Calibration</button>
           <button type="button" onclick="clearLog()">Clear Log</button>
@@ -620,10 +634,15 @@ void setupWebServer() {
 
   server.on("/toggle", HTTP_POST, []() {
     heaterEnabled = !heaterEnabled;
-    sendLog("Toggled heater: " + String(heaterEnabled));
+
+    if (heaterEnabled) {
+        sendLog("🔌 Heater ENABLED");
+    } else {
+        sendLog("🛑 Heater DISABLED");
+    }
+
     saveConfig();
-    server.sendHeader("Location", "/");
-    server.send(303);
+    server.send(200);  // No redirect — simple ack
   });
 
   server.on("/calibrate", HTTP_POST, []() {
@@ -740,7 +759,7 @@ void weatherTask(void* parameter) {
       }
     }
 
-    delay(5 * 60 * 1000);  // 5 min delay
+    delay(WEATHER_POLL_INTERVAL_MS);  // 5 min delay
   }
 }
 
