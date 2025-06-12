@@ -11,7 +11,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 
-#define DEVICE_VERSION "v2.2.0"
+#define DEVICE_VERSION "v2.3.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -898,6 +898,9 @@ void updateGlassTemp() {
 }
 
 void updateHeaterControl() {
+    // Persistent integral term
+    static float pwmIntegral = 0.0;
+
     // If manual PWM test is active → do nothing
     if (pwmTest) {
         return;
@@ -906,6 +909,7 @@ void updateHeaterControl() {
     // If heater is OFF → do nothing
     if (!heaterEnabled) {
         pwm = 0;
+        pwmIntegral = 0.0;  // Reset integral when heater is off
         analogWrite(PWM_PIN, pwm);
         return;
     }
@@ -920,26 +924,42 @@ void updateHeaterControl() {
     }
 
     float delta = glassTemp - t;
+    float error = targetDelta - delta;
 
-    // Simple control constants
-    const float Kp = 50.0;         // Proportional gain → tune this
-    const int PWM_MIN = 64;        // Minimum PWM when heating needed
-    const int PWM_MAX = 255;       // Max PWM
-    const int PWM_HOLD = 64;       // PWM to maintain delta at target
+    // PI control constants
+    const float Kp = 50.0;          // Proportional gain → tune this
+    const float Ki = 0.02;          // Integral gain → tune this carefully
+    const int PWM_MIN = 64;         // Minimum useful PWM
+    const int PWM_MAX = 255;        // Max PWM
+    const float integralMax = 500.0; // Anti-windup limit
 
     if (humidity >= humidityThreshold) {
-        // Automatic control active
-        if (delta < targetDelta) {
-            float error = targetDelta - delta;
-            int pwmValue = constrain(int(Kp * error), PWM_MIN, PWM_MAX);
-            pwm = pwmValue;
-        } else {
-            // Target reached → hold PWM at low level to prevent oscillation
-            pwm = PWM_HOLD;
+        // Update integral term
+        pwmIntegral += error;
+
+        // Anti-windup clamp
+        if (pwmIntegral > integralMax) {
+            pwmIntegral = integralMax;
+        } else if (pwmIntegral < -integralMax) {
+            pwmIntegral = -integralMax;
         }
+
+        // Compute PI output
+        float pwmValueF = Kp * error + Ki * pwmIntegral;
+
+        // Clamp to allowed range
+        int pwmValue = constrain(int(pwmValueF), PWM_MIN, PWM_MAX);
+
+        // If delta >= target → do not turn off PWM completely, use PI result
+        if (delta >= targetDelta && pwmValue < PWM_MIN) {
+            pwmValue = PWM_MIN;  // Hold at least min power to stabilize
+        }
+
+        pwm = pwmValue;
     } else {
-        // Humidity below threshold → force off PWM
+        // Humidity below threshold → force off PWM, reset integral
         pwm = 0;
+        pwmIntegral = 0.0;
     }
 
     analogWrite(PWM_PIN, pwm);
