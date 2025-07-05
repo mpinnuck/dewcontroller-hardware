@@ -11,7 +11,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 
-#define DEVICE_VERSION "v2.3.0"
+#define DEVICE_VERSION "v2.4.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -39,7 +39,7 @@ enum SensorSource {
   SOURCE_SHT40,
   SOURCE_WEATHER
 };
-SensorSource sensorSource = SOURCE_WEATHER;  // Default = weather station
+SensorSource sensorSource = SOURCE_SHT40;  // Default = weather station
 
 SemaphoreHandle_t   i2cMutex;
 
@@ -965,48 +965,48 @@ void updateHeaterControl() {
     analogWrite(PWM_PIN, pwm);
 }
 
-void updateCalibrationSampling() {
-    if (calibrating && (millis() - lastCalSampleTime >= CAL_SAMPLE_INTERVAL_MS)) {
-        lastCalSampleTime = millis();
+void updateCalibration() {
+  static unsigned long lastCalSampleTime = 0;
+  static bool firstCalSample = true;
 
-        float v = readThermistorVoltage();
-        float tAmbient = 0.0;
+  if (!calibrating) return;
+  if (millis() - lastCalSampleTime < CAL_SAMPLE_INTERVAL_MS) return;
+  lastCalSampleTime = millis();
 
-        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-            tAmbient = ambientTemp;
-            xSemaphoreGive(i2cMutex);
-        } else {
-            tAmbient = ambientTemp;
-        }
+  float Ta = ambientTemp;
+  float V = readThermistorVoltage();
+  int pwmPercent = pwm * 100 / 255;
 
-        struct tm timeinfo;
-        char timeStr[32] = "??";
-        if (getLocalTime(&timeinfo)) {
-            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-        }
+  struct tm timeinfo;
+  char timeStr[32] = "??";
+  if (getLocalTime(&timeinfo)) {
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  }
 
-        File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
-        if (f) {
-            if (firstCalSample) {
-                f.println("Time,Ambient_T,V_Thermistor,PWM%");
-                firstCalSample = false;
-            }
-            f.printf("%s,%.2f,%.3f,%d\n", timeStr, tAmbient, v, pwm * 100 / 255);
-            f.close();
-
-            sendLog(String(calCount + 1) + ": " + timeStr + " "
-                    + String(tAmbient, 2) + "C "
-                    + String(v, 3) + "V "
-                    + String(pwm * 100 / 255) + "%");
-        } else {
-            sendLog("❌ Could not open calibration file for writing.");
-        }
-
-        calCount++;
+  File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
+  if (f) {
+    if (firstCalSample) {
+      String header = "Sample,Time,Ta,V_Thermistor,PWM%";
+      f.println(header);
+      sendLog(header);
+      firstCalSample = false;
     }
+
+    String logLine = String(calCount + 1) + "," +
+                     String(timeStr) + "," +
+                     String(Ta, 2) + "," +
+                     String(V, 3) + "," +
+                     String(pwmPercent);
+
+    f.println(logLine);
+    f.close();
+
+    sendLog(logLine);
+    ++calCount;  // Efficient pre-increment
+  } else {
+    sendLog("❌ Could not open calibration file for writing.");
+  }
 }
-
-
 
 // Setup controller
 void setup() {
@@ -1060,6 +1060,6 @@ void loop() {
 #endif
         updateGlassTemp();
         updateHeaterControl();
-        updateCalibrationSampling();
+        updateCalibration();
     }
 }
