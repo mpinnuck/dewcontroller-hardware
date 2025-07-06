@@ -10,8 +10,10 @@
 #include "esp_log.h"
 #include <time.h>
 #include <HTTPClient.h>
+#include <math.h>
 
-#define DEVICE_VERSION "v2.4.0"
+
+#define DEVICE_VERSION "v2.5.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -27,6 +29,16 @@
 #define LED_PIN 21
 #define ON LOW
 #define OFF HIGH
+// default coefficients
+#define GLASSCOEFFA  -23.10
+#define GLASSCOEFFB   61.95
+#define GLASSCOEFFC  -19.20
+#define GLASSCOEFFDP  2       // number of decimal places
+
+// Tracks recent history for dT/dt estimation
+#define TA_HISTORY_SIZE 10
+#define TA_SAMPLE_INTERVAL_SEC 5
+
 
 #if DEBUG_MODE
   #define DEBUG_PRINT(x) Serial.println(x)
@@ -51,12 +63,19 @@ TwoWire I2CBus = TwoWire(1);  // Dedicated I2C bus
 Adafruit_AHTX0      aht;
 Adafruit_SHT4x      sht4;
 
+
+float TaHistory[TA_HISTORY_SIZE];
+unsigned long lastTaSampleTime = 0;
+
+
 // status and config variables
 float   ambientTemp = 0, humidity = 0, glassTemp = 0;
 float   targetDelta = 2.0, humidityThreshold = 80.0;
-float glassCoeffC = 131.5;
-float glassCoeffB = -111.7;
-float glassCoeffA = 23.3;
+// Rhermistor Steinhart–Hart model coefficients determined from calibration data
+float glassCoeffA = GLASSCOEFFA;
+float glassCoeffB = GLASSCOEFFB;
+float glassCoeffC = GLASSCOEFFC;
+
 String  wifiSSID = "MicroConcepts-2G";
 String  wifiPass = "";
 float   timezoneOffsetHours = 10.0;
@@ -165,9 +184,9 @@ void saveConfig() {
   StaticJsonDocument<512> doc;
   doc["delta"] = targetDelta;
   doc["humidity"] = humidityThreshold;
-  doc["glassCoeffC"] = glassCoeffC;
-  doc["glassCoeffB"] = glassCoeffB;
   doc["glassCoeffA"] = glassCoeffA;
+  doc["glassCoeffB"] = glassCoeffB;
+  doc["glassCoeffC"] = glassCoeffC;
   doc["heater"] = heaterEnabled;
   doc["ssid"] = wifiSSID;
   doc["password"] = wifiPass;
@@ -206,9 +225,9 @@ void loadConfig() {
   // Assign values
   targetDelta         = doc["delta"]       | 2.0;
   humidityThreshold   = doc["humidity"]    | 80.0;
-  glassCoeffC         = doc["glassCoeffC"] | 131.5;
-  glassCoeffB         = doc["glassCoeffB"] | -111.7;
-  glassCoeffA         = doc["glassCoeffA"] | 23.3;
+  // glassCoeffA = doc["glassCoeffA"] | GLASSCOEFFA;
+  // glassCoeffB = doc["glassCoeffB"] | GLASSCOEFFB;
+  // glassCoeffC = doc["glassCoeffC"] | GLASSCOEFFC;
   heaterEnabled       = doc["heater"]      | false;
   wifiSSID            = doc["ssid"]        | "MicroConcepts-2G";
   wifiPass            = doc["password"]    | "leanneannatinka";
@@ -221,10 +240,10 @@ void loadConfig() {
   sendLog("📦 WiFi SSID: " + wifiSSID);
   // sendLog("📦 WiFi Password: " + wifiPass);  // Do NOT log password
   sendLog(String("📦 Timezone Offset: UTC") + (timezoneOffsetHours >= 0 ? "+" : "") + String(timezoneOffsetHours, 1));
-  sendLog("📦 T_glass = T_ambient + "
-        + String(glassCoeffC,1) + " + ("
-        + String(glassCoeffB,1) + "·V) + ("
-        + String(glassCoeffA,1) + "·V²)");
+  sendLog("📦 Tg = A·V² + B·V + C");
+  sendLog("📦 A = " + String(glassCoeffA, GLASSCOEFFDP));
+  sendLog("📦 B = " + String(glassCoeffB, GLASSCOEFFDP));
+  sendLog("📦 C = " + String(glassCoeffC, GLASSCOEFFDP));
 }
 
 float readThermistorVoltage() {
@@ -233,17 +252,66 @@ float readThermistorVoltage() {
 
 float readGlassTemp() {
   float V = readThermistorVoltage();
-  float tAmbient;
+  // Quadratic best-fit: Tg = A·V² + B·V + C
+  return (glassCoeffA * V * V) + (glassCoeffB * V) + glassCoeffC;
+}
 
-  // Thread-safe read of ambientTemp:
-  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-      tAmbient = ambientTemp;
-      xSemaphoreGive(i2cMutex);
-  } else {
-      tAmbient = ambientTemp;
-  }
+// Update ambient temperature history
+void updateTaHistory(float newTa) {
+    for (int i = 1; i < TA_HISTORY_SIZE; i++) {
+        TaHistory[i - 1] = TaHistory[i];
+    }
+    TaHistory[TA_HISTORY_SIZE - 1] = newTa;
+}
 
-  return tAmbient + glassCoeffC + glassCoeffB * V + glassCoeffA * V * V;
+// Called every LOOP_INTERVAL_MS
+void updateGlassTemp() {
+    float t, h;
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+        t = ambientTemp;
+        h = humidity;
+        xSemaphoreGive(i2cMutex);
+    }
+
+    glassTemp = readGlassTemp();
+
+    // Update ambient history every few seconds
+    if (millis() - lastTaSampleTime > TA_SAMPLE_INTERVAL_SEC * 1000UL) {
+        updateTaHistory(t);
+        lastTaSampleTime = millis();
+    }
+
+    logThermalLagInfo();
+}
+
+// Call this inside your updateGlassTemp or updateHeaterControl
+// Log thermal lag only on significant gradient changes
+void logThermalLagInfo() {
+    static float prevTa = 0.0;
+    static unsigned long prevTime = 0;
+
+    float Ta = ambientTemp;
+    float Tg = glassTemp;
+
+    unsigned long now = millis();
+    float dtSeconds = (now - prevTime) / 1000.0;
+
+    if (prevTime == 0 || dtSeconds < 60) {
+        prevTa = Ta;
+        prevTime = now;
+        return;
+    }
+
+    float gradientPerHour = (Ta - prevTa) / dtSeconds * 3600.0;
+    float delta = Tg - Ta;
+
+    sendLog(String("📊 Tg = ") + String(Tg, 2) +
+            "°C, Ta = " + String(Ta, 2) +
+            "°C, Tg - Ta = " + String(delta, 2) +
+            "°C, dTa/dt = " + String(gradientPerHour, 2) + " °C/hour");
+
+    prevTa = Ta;
+    prevTime = now;
 }
 
 
@@ -550,10 +618,11 @@ void setupWebServer() {
             </div>
             <button type="submit">Update Settings</button>
           </form>
-          <p> T_glass = T_ambient + )rawliteral" 
-                      + String(glassCoeffC,1) + R"rawliteral( + ()rawliteral"
-                      + String(glassCoeffB,1) + R"rawliteral(·V + ()rawliteral"
-                      + String(glassCoeffA,1) + R"rawliteral(·V²)</p>
+            <p> T_glass = T_ambient + )rawliteral" 
+              + String(glassCoeffA, 1) + R"rawliteral(·V² + )rawliteral"
+              + String(glassCoeffB, 1) + R"rawliteral(·V + )rawliteral"
+              + String(glassCoeffC, 1) + R"rawliteral(</p>
+            </p>
         </div>
       </div>
 
@@ -886,17 +955,6 @@ void simulateHardware() {
     humidity = 78.0 + sin(millis() / 8000.0);
 }
 
-void updateGlassTemp() {
-    float t, h;
-    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-        t = ambientTemp;
-        h = humidity;
-        xSemaphoreGive(i2cMutex);
-    }
-
-    glassTemp = readGlassTemp();
-}
-
 void updateHeaterControl() {
     // Persistent integral term
     static float pwmIntegral = 0.0;
@@ -906,8 +964,8 @@ void updateHeaterControl() {
         return;
     }
 
-    // If heater is OFF → do nothing
-    if (!heaterEnabled) {
+    // If heater is OFF or error reading gass temp → do nothing
+    if (!heaterEnabled || isnan(glassTemp)) {
         pwm = 0;
         pwmIntegral = 0.0;  // Reset integral when heater is off
         analogWrite(PWM_PIN, pwm);
@@ -933,6 +991,7 @@ void updateHeaterControl() {
     const int PWM_MAX = 255;        // Max PWM
     const float integralMax = 500.0; // Anti-windup limit
 
+//    if (1){ 
     if (humidity >= humidityThreshold) {
         // Update integral term
         pwmIntegral += error;
@@ -1061,5 +1120,6 @@ void loop() {
         updateGlassTemp();
         updateHeaterControl();
         updateCalibration();
+        logThermalLagInfo();
     }
 }
