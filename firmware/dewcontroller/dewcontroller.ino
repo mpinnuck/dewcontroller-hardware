@@ -8,6 +8,10 @@
 #include <Adafruit_SHT4x.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <esp_netif.h>
+#include "esp_wifi.h"
+#include "esp_sntp.h"
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
@@ -16,7 +20,7 @@
 #include <HTTPClient.h>
 #include <math.h>
 
-#define DEVICE_VERSION "v2.6.0"
+#define DEVICE_VERSION "v2.7.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -49,13 +53,13 @@
 
 #define DEFAULT_TEMPDELTA     2.0
 
-
 //#define DEBUG_MODE 1
 #if DEBUG_MODE
   #define DEBUG_PRINT(x) Serial.println(x)
 #else
   #define DEBUG_PRINT(x) do {} while (0)
 #endif
+
 
 enum SensorSource {
   SOURCE_AHT20,
@@ -80,7 +84,7 @@ float targetDelta = DEFAULT_TEMPDELTA;                    // desired (Tg - Ta)
 
 // NEW: dew-spread control (spread = Ta - Td)
 float dewSpreadThreshold  = DEFAULT_DEWSPREAD;            // default °C
-float dewSpreadHysteresis = DEWSPREAD_HYSTERISIS;            // °C to avoid chatter
+float dewSpreadHysteresis = DEWSPREAD_HYSTERISIS;         // °C to avoid chatter
 
 // Thermistor coefficients (best-fit)
 float glassCoeffA = GLASSCOEFFA;
@@ -89,7 +93,8 @@ float glassCoeffC = GLASSCOEFFC;
 
 String  wifiSSID = "MicroConcepts-2G";
 String  wifiPass = "";
-float   timezoneOffsetHours = 10.0;
+// Timezone rule for TZ environment (AEST/AEDT for Sydney by default)
+String  timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 bool    heaterEnabled = false, calibrating = false;
 
 // -------------- Calibration variables --------------
@@ -103,7 +108,54 @@ bool    firstCalSample = true;  // header line
 const int MAX_LOG_SIZE = 32768;
 String  logBuffer;
 
+bool ntpInitialized = false;
+
+// Forward declarations
+void setupNTP();
+void setupWebServer();
+
+
 // -------------- Utility --------------
+
+// Utility: decode Wi-Fi status to readable string
+String wifiStatusToString(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:      return "Idle";
+    case WL_NO_SSID_AVAIL:    return "No SSID available";
+    case WL_SCAN_COMPLETED:   return "Scan completed";
+    case WL_CONNECTED:        return "Connected";
+    case WL_CONNECT_FAILED:   return "Connect failed";
+    case WL_CONNECTION_LOST:  return "Connection lost";
+    case WL_DISCONNECTED:     return "Disconnected";
+    default:                  return "Unknown (" + String(status) + ")";
+  }
+}
+
+// Logs the current WiFi.status() with a readable message
+void logWiFiStatus(const String& prefix = "WiFi") {
+  wl_status_t status = WiFi.status();
+  String msg = wifiStatusToString(status);
+
+  if (status == WL_CONNECTED) {
+    msg += " (" + WiFi.localIP().toString() + ", RSSI " + String(WiFi.RSSI()) + " dBm)";
+  }
+
+  sendLog(prefix + " → " + msg);
+}
+
+// Apply timezone rule locally, even without NTP (used in AP mode)
+void applyLocalTimezone() {
+  if (timezoneRule.isEmpty()) {
+    timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
+    sendLog("⚙️ No timezone rule found — defaulting to Australia/Sydney");
+  }
+
+  setenv("TZ", timezoneRule.c_str(), 1);
+  tzset();
+
+  sendLog("🕒 Local timezone applied: " + timezoneRule);
+}
+
 String getStorageUsedSummary() {
   size_t total = SPIFFS.totalBytes();
   size_t used = SPIFFS.usedBytes();
@@ -139,6 +191,24 @@ float dewPointC(float T, float RH) {
   const float b = 243.12f; // °C
   float gamma = (a * T) / (b + T) + log(RH / 100.0f);
   return (b * gamma) / (a - gamma);
+}
+
+void sendLog(const String& msg) {
+  static char lastTimeStr[32] = "??";
+  struct tm timeinfo;
+
+  // Use current local time if available
+  if (getLocalTime(&timeinfo, 50)) {  // short timeout
+    strftime(lastTimeStr, sizeof(lastTimeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  }
+
+  String logLine = "[" + String(lastTimeStr) + "] " + msg;
+  DEBUG_PRINT(logLine);
+
+  logBuffer += logLine + "\n";
+  if (logBuffer.length() > MAX_LOG_SIZE) {
+    logBuffer = logBuffer.substring(logBuffer.length() - MAX_LOG_SIZE);
+  }
 }
 
 bool fetchOutdoorWeather(float* outTemp, float* outHumidity) {
@@ -189,14 +259,6 @@ bool fetchOutdoorWeather(float* outTemp, float* outHumidity) {
   }
 }
 
-void sendLog(const String& msg) {
-  DEBUG_PRINT(msg);
-  logBuffer += msg + "\n";
-  if (logBuffer.length() > MAX_LOG_SIZE) {
-    logBuffer = logBuffer.substring(logBuffer.length() - MAX_LOG_SIZE);
-  }
-}
-
 void saveConfig() {
   StaticJsonDocument<512> doc;
   doc["delta"] = targetDelta;
@@ -208,7 +270,8 @@ void saveConfig() {
   doc["heater"] = heaterEnabled;
   doc["ssid"] = wifiSSID;
   doc["password"] = wifiPass;
-  doc["timezone"] = timezoneOffsetHours;
+  doc["timezoneRule"] = timezoneRule;            // store full TZ rule
+
   File file = SPIFFS.open(CONFIG_FILE, FILE_WRITE);
   if (file) {
     serializeJson(doc, file);
@@ -241,26 +304,26 @@ void loadConfig() {
   }
 
   targetDelta          = doc["delta"]               | DEFAULT_TEMPDELTA;
-  dewSpreadThreshold   = doc["dewSpread"]           | DEFAULT_DEWSPREAD;  // default
-  dewSpreadHysteresis  = doc["dewSpreadHysteresis"] | DEWSPREAD_HYSTERISIS;  // default
+  dewSpreadThreshold   = doc["dewSpread"]           | DEFAULT_DEWSPREAD;        // default
+  dewSpreadHysteresis  = doc["dewSpreadHysteresis"] | DEWSPREAD_HYSTERISIS;     // default
 
   // Back-compat for older configs that only had "humidity" key:
   if (!doc.containsKey("dewSpread") && doc.containsKey("humidity")) {
     dewSpreadThreshold = DEFAULT_DEWSPREAD; // migrate to sensible default
   }
 
-  heaterEnabled       = doc["heater"]      | false;
-  wifiSSID            = doc["ssid"]        | "MicroConcepts-2G";
-  wifiPass            = doc["password"]    | "leanneannatinka";
-  timezoneOffsetHours = doc["timezone"]    | 10.0;
+  heaterEnabled       = doc["heater"]       | false;
+  wifiSSID            = doc["ssid"]         | "MicroConcepts-2G";
+  wifiPass            = doc["password"]     | "leanneannatinka";
+  timezoneRule        = doc["timezoneRule"] | "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 
   sendLog("✅ Config loaded from SPIFFS");
-  sendLog("📦 Temperature Delta: " + String(targetDelta, 2));
+  sendLog(" Temperature Delta: " + String(targetDelta, 2));
   sendLog("📦 Dew Spread Threshold: " + String(dewSpreadThreshold, 2) + " °C");
   sendLog("📦 Dew Spread Hysteresis: " + String(dewSpreadHysteresis, 2) + " °C");
   sendLog("📦 Heater Enabled: " + String(heaterEnabled ? "true" : "false"));
   sendLog("📦 WiFi SSID: " + wifiSSID);
-  sendLog(String("📦 Timezone Offset: UTC") + (timezoneOffsetHours >= 0 ? "+" : "") + String(timezoneOffsetHours, 1));
+  sendLog("📦 Timezone Rule: " + timezoneRule);
   sendLog("📦 Tg = A·V² + B·V + C");
   sendLog("📦 A = " + String(glassCoeffA, GLASSCOEFFDP));
   sendLog("📦 B = " + String(glassCoeffB, GLASSCOEFFDP));
@@ -347,58 +410,174 @@ void setupWiFi() {
   digitalWrite(LED_PIN, LOW);
 
   sendLog("🔌 Connecting to Wi-Fi...");
-  WiFi.disconnect(true);
-  delay(100);
+
+  // --- Step 1: Clean disconnect and setup STA mode ---
+  WiFi.disconnect(true, true);
+  delay(200);
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname("DewController");
-  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
   WiFi.setSleep(false);
-  #if DEBUG_MODE
-    esp_log_level_set("*", ESP_LOG_ERROR);
-  #endif
+  WiFi.setAutoReconnect(true);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Stronger signal for tough 2G routers
 
-  int maxRetries = 10;
-  int retries = 0;
-
-  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
-    delay(500);
-    retries++;
-    sendLog("⏳ Attempt " + String(retries) + ": Status = " + String(WiFi.status()));
+  // --- Step 1.5: TPG Router-specific hostname setup ---
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  int attempts = 0;
+  while (!netif && attempts++ < 10) {  // wait up to ~1s for interface
+    delay(100);
+    netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
   }
 
+  if (netif) {
+    // Stop DHCP before changing hostname
+    esp_netif_dhcpc_stop(netif);
+    delay(100);  // Extra delay for TPG routers
+
+    // Set hostname on the ESP network interface - try shorter name for TPG
+    esp_netif_set_hostname(netif, "DewController");
+    sendLog("🏷 Hostname set via esp_netif before DHCP: DewController");
+
+    // Force clear any cached DHCP state for TPG compatibility
+    esp_netif_dhcpc_start(netif);
+  } else {
+    sendLog("⚠️ Failed to set hostname — esp_netif not ready");
+  }
+
+  // Set Arduino layer hostname
+  WiFi.setHostname("DewController");
+  
+  // Additional TPG router compatibility - set WiFi config hostname
+  wifi_config_t wifi_config;
+  esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
+  // Clear any cached data that might interfere
+  memset(&wifi_config, 0, sizeof(wifi_config_t));
+  sendLog("🔧 WiFi config cleared for TPG router compatibility");
+
+  // --- Step 2: Begin initial connection ---
+  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  delay(500); // short warm-up
+
+  const int maxRetries = 40;  // total loop time ≈ 40s
+  int retries = 0;
+  wl_status_t lastStatus = WL_IDLE_STATUS;
+
+  // --- Step 3: Poll connection progress safely ---
+  sendLog("⏳ Waiting for Wi-Fi connection...");
+  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
+    wl_status_t status = WiFi.status();
+
+    // Log only when status changes
+    if (status != lastStatus) {
+      sendLog("⏳ Wi-Fi status: " + wifiStatusToString(status));
+      lastStatus = status;
+    }
+
+    // Do not manually reset or reconnect here — let the stack retry itself
+    delay(1000);
+    retries++;
+  }
+
+  // --- Step 4: Handle success immediately ---
   if (WiFi.status() == WL_CONNECTED) {
     digitalWrite(LED_PIN, HIGH);
-    sendLog("✅ WiFi IP: " + WiFi.localIP().toString());
+    sendLog("✅ Wi-Fi connected");
+    sendLog("🌐 IP address: " + WiFi.localIP().toString());
+    sendLog("📶 RSSI: " + String(WiFi.RSSI()) + " dBm");
 
     if (!MDNS.begin("DewController")) {
-      sendLog("❌ Error setting up MDNS responder!");
+      sendLog("❌ mDNS failed to start!");
     } else {
-      sendLog("✅ MDNS responder started as DewController.local");
+      sendLog("✅ mDNS responder started as DewController.local");
     }
 
-    long gmtOffset_sec = timezoneOffsetHours * 3600;
-    configTime(gmtOffset_sec, 0, "pool.ntp.org", "time.nist.gov");
-
-    struct tm timeinfo;
-    int waitCount = 0;
-    while (!getLocalTime(&timeinfo) && waitCount < 20) {
-      delay(200);
-      waitCount++;
-    }
-
-    if (getLocalTime(&timeinfo)) {
-      char buf[64];
-      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-      sendLog(String("⏰ NTP time set: ") + buf);
+    // Initialize NTP only once
+    if (!ntpInitialized) {
+      setupNTP();
+      ntpInitialized = true;
     } else {
-      sendLog("⚠️ Failed to get NTP time.");
+      sendLog("⏱ NTP already active — skipping reinit");
     }
 
+    setupWebServer();
+    return;
+  }
+
+  // --- Step 5: Grace period for late DHCP ---
+  sendLog("⚠️ Connection not confirmed after " + String(maxRetries) + " attempts.");
+  sendLog("⏱ Waiting up to 15 more seconds for late DHCP...");
+
+  unsigned long graceStart = millis();
+  bool connected = false;
+  while (millis() - graceStart < 15000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+      break;
+    }
+    delay(1000);
+  }
+
+  if (connected) {
+    sendLog("✅ Late Wi-Fi success detected!");
+    digitalWrite(LED_PIN, HIGH);
+    sendLog("🌐 IP address: " + WiFi.localIP().toString());
+    sendLog("📶 RSSI: " + String(WiFi.RSSI()) + " dBm");
+
+    if (!MDNS.begin("DewController")) {
+      sendLog("❌ mDNS failed to start!");
+    } else {
+      sendLog("✅ mDNS responder started as DewController.local");
+    }
+
+    applyLocalTimezone();
+
+    if (!ntpInitialized) {
+      setupNTP();
+      ntpInitialized = true;
+    } else {
+      sendLog("⏱ NTP already active — skipping reinit");
+    }
+
+    setupWebServer();
+    return;
+  }
+
+  // --- Step 6: Fallback to AP mode ---
+  sendLog("❌ Wi-Fi connection failed after extended wait. Switching to Access Point mode...");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("DewHeaterSetup");
+  IPAddress apIP = WiFi.softAPIP();
+  sendLog("📡 AP mode started — connect to SSID 'DewHeaterSetup'");
+  sendLog("📶 AP IP address: " + apIP.toString());
+  applyLocalTimezone(); // keep timestamps correct in AP mode
+  setupWebServer();
+}
+
+
+void setupNTP() {
+  applyLocalTimezone(); // Ensure local time context before logging
+  sendLog("🕓 Initializing NTP...");
+
+  if (timezoneRule.isEmpty()) {
+    timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
+    sendLog("⚙️ No timezone rule found — defaulting to Australia/Sydney");
+  }
+
+  // Step 1 — configure NTP (sets up SNTP client)
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  sendLog("🌐 NTP client configured with timezone rule: " + timezoneRule);
+
+  // Step 2 — immediately apply the timezone AFTER NTP setup
+  setenv("TZ", timezoneRule.c_str(), 1);
+  tzset();
+
+  // Step 3 — now safely call getLocalTime()
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 5000)) {
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
+    sendLog(String("✅ NTP time synchronized: ") + buf);
   } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("DewHeaterSetup");
-    sendLog("❌ WiFi failed. Starting fallback AP...");
-    sendLog("📡 AP mode IP: " + WiFi.softAPIP().toString());
+    sendLog("⚠️ NTP not yet synchronized (will retry automatically)");
   }
 }
 
@@ -599,8 +778,8 @@ void setupWebServer() {
               <input name="password" type="password" value=")rawliteral" + wifiPass + R"rawliteral(">
             </div>
             <div class="inputrow">
-              <label>Timezone Offset:</label>
-              <input name="timezone" value=")rawliteral" + String(timezoneOffsetHours, 1) + R"rawliteral(">
+              <label>Timezone Rule:</label>
+              <input name="timezoneRule" value=")rawliteral" + timezoneRule + R"rawliteral(">
             </div>
             <button type="submit">Update Settings</button>
           </form>
@@ -704,12 +883,12 @@ void setupWebServer() {
   });
 
   server.on("/settings", HTTP_POST, []() {
-    if (server.hasArg("delta"))     targetDelta = server.arg("delta").toFloat();
-    if (server.hasArg("dewspread")) dewSpreadThreshold = server.arg("dewspread").toFloat();
-    if (server.hasArg("dewhyst"))   dewSpreadHysteresis = server.arg("dewhyst").toFloat();
-    if (server.hasArg("ssid"))      wifiSSID = server.arg("ssid");
-    if (server.hasArg("password"))  wifiPass = server.arg("password");
-    if (server.hasArg("timezone"))  timezoneOffsetHours = server.arg("timezone").toFloat();
+    if (server.hasArg("delta"))        targetDelta      = server.arg("delta").toFloat();
+    if (server.hasArg("dewspread"))    dewSpreadThreshold = server.arg("dewspread").toFloat();
+    if (server.hasArg("dewhyst"))      dewSpreadHysteresis = server.arg("dewhyst").toFloat();
+    if (server.hasArg("ssid"))         wifiSSID         = server.arg("ssid");
+    if (server.hasArg("password"))     wifiPass         = server.arg("password");
+    if (server.hasArg("timezoneRule")) timezoneRule     = server.arg("timezoneRule");
 
     sendLog("⚙️ Settings updated");
     saveConfig();
@@ -875,25 +1054,119 @@ void sensorTask_SHT40(void* parameter) {
   }
 }
 
+
+// ------------------------------------------------------------
+// Auto-reconnect + mDNS reinit
+// ------------------------------------------------------------
+// Handles background Wi-Fi monitoring and gentle recovery if connection is lost
 void handleWiFiReconnect() {
   static unsigned long lastReconnectAttempt = 0;
+  static unsigned long offlineSince = 0;
   static bool wasDisconnected = false;
 
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!wasDisconnected) {
-      sendLog("⚠️ WiFi disconnected, attempting reconnect...");
-      wasDisconnected = true;
-    }
-    if (millis() - lastReconnectAttempt > 10000) {
-      lastReconnectAttempt = millis();
-      WiFi.disconnect();
-      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-    }
-  } else {
+  wifi_mode_t mode = WiFi.getMode();
+  wl_status_t status = WiFi.status();
+
+  bool haveCreds = !wifiSSID.isEmpty();   // we know user wants STA if SSID configured
+  if (!haveCreds) return;
+
+  // ---- Case 1: STA is connected ----
+  if (status == WL_CONNECTED) {
     if (wasDisconnected) {
-      sendLog("✅ WiFi reconnected: " + WiFi.localIP().toString());
       wasDisconnected = false;
+      offlineSince = 0;
+
+      sendLog("✅ Wi-Fi reconnected: " + WiFi.localIP().toString());
+      logWiFiStatus("WiFi");
+
+      delay(500); // give stack time to stabilise
+
+      if (!MDNS.begin("DewController")) {
+        sendLog("❌ Failed to restart mDNS responder!");
+      } else {
+        sendLog("✅ mDNS responder restarted as DewController.local");
+      }
+
+      server.stop();
+      delay(200);
+      setupWebServer();
+      sendLog("🌐 Web server rebound to Wi-Fi interface");
+
+      applyLocalTimezone();
+
+      if (!ntpInitialized) {
+        setupNTP();
+        ntpInitialized = true;
+      } else {
+        sendLog("⏱ NTP already active — skipping reinit");
+      }
     }
+    return;
+  }
+
+  // ---- Case 2: Not connected ----
+  if (!wasDisconnected) {
+    wasDisconnected = true;
+    offlineSince = millis();
+    sendLog("⚠️ Wi-Fi disconnected, will attempt reconnect...");
+    logWiFiStatus("WiFi");
+  }
+
+  unsigned long now = millis();
+  const unsigned long reconnectIntervalMs = 10000;
+  if (now - lastReconnectAttempt < reconnectIntervalMs) return;
+  lastReconnectAttempt = now;
+
+  // Helper lambda for hostname reapplication before connecting (TPG compatible)
+  auto reapplyHostname = []() {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+      esp_netif_dhcpc_stop(netif);
+      delay(100);  // TPG routers need extra time
+      esp_netif_set_hostname(netif, "DewController");
+      esp_netif_dhcpc_start(netif);
+      sendLog("🏷 Hostname reapplied for TPG router: DewController");
+    } else {
+      sendLog("⚠️ Failed to reapply hostname — esp_netif not ready");
+    }
+    WiFi.setHostname("DewController");
+    
+    // Clear WiFi config for TPG compatibility
+    wifi_config_t wifi_config;
+    esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
+    memset(&wifi_config, 0, sizeof(wifi_config_t));
+  };
+
+  // --- Reconnect attempts depending on mode ---
+  if (mode == WIFI_AP) {
+    sendLog("🔁 STA retry while in AP mode (WIFI_AP_STA)...");
+    WiFi.mode(WIFI_AP_STA);
+    reapplyHostname();
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  }
+  else if (mode == WIFI_AP_STA || mode == WIFI_STA) {
+    sendLog("🔁 Attempting STA reconnect...");
+    WiFi.disconnect();
+    reapplyHostname();
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  }
+  else {
+    sendLog("⚙️ Unexpected Wi-Fi mode, normalising to STA and reconnecting...");
+    WiFi.mode(WIFI_STA);
+    reapplyHostname();
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  }
+
+  // Optional: after long offline duration, restart the interface more aggressively
+  const unsigned long offlineResetMs = 90000; // 90s
+  if (offlineSince && (now - offlineSince > offlineResetMs)) {
+    sendLog("🧩 Wi-Fi offline for >90 s — restarting interface...");
+    WiFi.disconnect(true, true);
+    delay(200);
+    WiFi.mode(WIFI_STA);
+    reapplyHostname();
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+    offlineSince = now;
   }
 }
 
@@ -1053,6 +1326,47 @@ void updateCalibration() {
   }
 }
 
+// Check if NTP has synced; retry if not, and detect DST changes (AEST/AEDT)
+void handleNTP() {
+  static unsigned long lastCheck = 0;
+  static bool timeSynced = false;
+  static String lastTZ = "";
+
+  if (millis() - lastCheck < 30000) return;  // check every 30s
+  lastCheck = millis();
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
+    String tzName = String(timeinfo.tm_isdst ? "AEDT" : "AEST");  // fallback label
+
+    // --- First successful sync ---
+    if (!timeSynced) {
+      sendLog(String("✅ NTP time synchronized: ") + buf);
+      lastTZ = tzName;
+      timeSynced = true;
+    }
+
+    // --- Detect DST transition ---
+    if (tzName != lastTZ && lastTZ != "") {
+      sendLog(String("🕒 Daylight Saving Time change detected: ") + lastTZ + " → " + tzName);
+      lastTZ = tzName;
+    }
+  } 
+  else {
+    sendLog("⚠️ NTP not yet synchronized, retrying...");
+    // Optional: re-init NTP in case config was lost
+    if (timezoneRule.isEmpty()) {
+      timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
+    }
+    setenv("TZ", timezoneRule.c_str(), 1);
+    tzset();
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  }
+}
+
+
 // ---------------- Setup ----------------
 void setup() {
   logBuffer = "";
@@ -1070,8 +1384,8 @@ void setup() {
 
   SPIFFS.begin(true);
   loadConfig();
+  applyLocalTimezone();
   setupWiFi();
-  setupWebServer();
 
   i2cMutex = xSemaphoreCreateMutex();
   if (sensorSource == SOURCE_SHT40) {
@@ -1105,5 +1419,7 @@ void loop() {
     updateHeaterControl();
     updateCalibration();
     logThermalLagInfo();
+    handleNTP();
   }
+  delay(100); // or yield(), to give time to background tasks
 }
