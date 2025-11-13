@@ -20,14 +20,15 @@
 #include <HTTPClient.h>
 #include <math.h>
 
-#define DEVICE_VERSION "v2.7.0"
+#define DEVICE_VERSION "v2.7.1"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
 #define CONFIG_FILE "/config.json"
 #define CALIBRATION_FILE "/calibration.csv"
-#define LOOP_INTERVAL_MS 2000
+#define LOOP_INTERVAL_MS 1000
 #define WEATHER_POLL_INTERVAL_MS 5 * 60 * 1000 // 300000 ms or 5 minutes
+#define WIFI_STATUS_CHECK_INTERVAL_MS 20000 // 20 seconds
 
 #define I2C_SDA 5
 #define I2C_SCL 6
@@ -69,7 +70,11 @@ enum SensorSource {
 SensorSource sensorSource = SOURCE_SHT40;  // default
 
 SemaphoreHandle_t   i2cMutex;
+SemaphoreHandle_t   cacheMutex;
 TaskHandle_t        sensorTaskHandle;
+TaskHandle_t        backgroundTaskHandle;
+TaskHandle_t        networkTaskHandle;
+TaskHandle_t        applicationTaskHandle;
 WebServer           server(80);
 TwoWire             I2CBus = TwoWire(1);  // Dedicated I2C bus
 Adafruit_AHTX0      aht;
@@ -105,10 +110,18 @@ const unsigned long CAL_SAMPLE_INTERVAL_MS = 30000;  // 30 seconds
 unsigned long lastCalSampleTime = 0;
 bool    firstCalSample = true;  // header line
 
-const int MAX_LOG_SIZE = 32768;
+const int MAX_LOG_SIZE = 16384;
 String  logBuffer;
 
 bool ntpInitialized = false;
+
+// Background task cache variables
+float cached_td = NAN;
+float cached_spread = NAN;
+String cached_calFileSize = "0 KB";
+String cached_storageInfo = "0/0 KB";
+int cached_rssi = -99;
+unsigned long lastCacheUpdate = 0;
 
 // Forward declarations
 void setupNTP();
@@ -116,6 +129,21 @@ void setupWebServer();
 
 
 // -------------- Utility --------------
+
+// Smart delay that yields periodically without constant overhead
+void delayWithYield(unsigned long ms) {
+  unsigned long chunks = ms / 100;
+  unsigned long remainder = ms % 100;
+  
+  for (unsigned long i = 0; i < chunks; i++) {
+    delay(100);
+    yield();
+  }
+  
+  if (remainder > 0) {
+    delay(remainder);
+  }
+}
 
 // Utility: decode Wi-Fi status to readable string
 String wifiStatusToString(wl_status_t status) {
@@ -260,26 +288,35 @@ bool fetchOutdoorWeather(float* outTemp, float* outHumidity) {
 }
 
 void saveConfig() {
-  StaticJsonDocument<512> doc;
-  doc["delta"] = targetDelta;
-  doc["dewSpread"] = dewSpreadThreshold;         // NEW
-  doc["dewSpreadHysteresis"] = dewSpreadHysteresis; // NEW
-  doc["glassCoeffA"] = glassCoeffA;
-  doc["glassCoeffB"] = glassCoeffB;
-  doc["glassCoeffC"] = glassCoeffC;
-  doc["heater"] = heaterEnabled;
-  doc["ssid"] = wifiSSID;
-  doc["password"] = wifiPass;
-  doc["timezoneRule"] = timezoneRule;            // store full TZ rule
+  // Use a separate task for file I/O to avoid main loop blocking
+  xTaskCreate([](void* param) {
+    StaticJsonDocument<512> doc;
+    doc["delta"] = targetDelta;
+    doc["dewSpread"] = dewSpreadThreshold;         // NEW
+    doc["dewSpreadHysteresis"] = dewSpreadHysteresis; // NEW
+    doc["glassCoeffA"] = glassCoeffA;
+    doc["glassCoeffB"] = glassCoeffB;
+    doc["glassCoeffC"] = glassCoeffC;
+    doc["heater"] = heaterEnabled;
+    doc["ssid"] = wifiSSID;
+    doc["password"] = wifiPass;
+    doc["timezoneRule"] = timezoneRule;            // store full TZ rule
 
-  File file = SPIFFS.open(CONFIG_FILE, FILE_WRITE);
-  if (file) {
-    serializeJson(doc, file);
-    file.close();
-    sendLog("💾 Config saved");
-  } else {
-    sendLog("❌ Failed to save config");
-  }
+    yield(); // Yield before file operations
+    
+    File file = SPIFFS.open(CONFIG_FILE, FILE_WRITE);
+    if (file) {
+      yield(); // Yield before serialization
+      serializeJson(doc, file);
+      yield(); // Yield after serialization
+      file.close();
+      sendLog("💾 Config saved");
+    } else {
+      sendLog("❌ Failed to save config");
+    }
+    
+    vTaskDelete(NULL); // Clean up task
+  }, "SaveConfigTask", 2048, NULL, 1, NULL);
 }
 
 void loadConfig() {
@@ -363,11 +400,9 @@ void updateGlassTemp() {
     updateTaHistory(t);
     lastTaSampleTime = millis();
   }
-
-  logThermalLagInfo();
 }
 
-// Log thermal lag periodically
+// Log thermal lag periodically - now called less frequently from main loop
 void logThermalLagInfo() {
   static float prevTa = 0.0;
   static unsigned long prevTime = 0;
@@ -376,14 +411,15 @@ void logThermalLagInfo() {
   float Tg = glassTemp;
 
   unsigned long now = millis();
-  float dtSeconds = (now - prevTime) / 1000.0;
 
-  if (prevTime == 0 || dtSeconds < 60) {
+  // Initialize on first call
+  if (prevTime == 0) {
     prevTa = Ta;
     prevTime = now;
     return;
   }
 
+  float dtSeconds = (now - prevTime) / 1000.0;
   float gradientPerHour = (Ta - prevTa) / dtSeconds * 3600.0;
   float delta = Tg - Ta;
 
@@ -615,6 +651,35 @@ void setupWebServer() {
 
         function updateStatus() {
           fetch('/status.json').then(r => r.json()).then(data => {
+            // Update WiFi status - connected with signal strength and color coding
+            const wifiStatus = document.getElementById("wifiStatus");
+            const signal = parseInt(data.wifiSignal) || 0;
+            
+            let quality = "";
+            let bgColor = "";
+            
+            if (signal >= -50) {
+              quality = "Excellent";
+              bgColor = "#ccffcc";
+            } else if (signal >= -60) {
+              quality = "Good";
+              bgColor = "#ccffcc";
+            } else if (signal >= -70) {
+              quality = "Fair";
+              bgColor = "#ffcc99";
+            } else if (signal >= -80) {
+              quality = "Weak";
+              bgColor = "#ffcc99";
+            } else {
+              quality = "Very Weak";
+              bgColor = "#ffcccc";
+            }
+            
+            const signalStr = data.wifiSignal ? ` ${quality} (${data.wifiSignal}dBm)` : "";
+            wifiStatus.innerText = `📶 Connected${signalStr}`;
+            wifiStatus.style.backgroundColor = bgColor;
+            wifiStatus.style.color = "#333";
+
             document.getElementById("ambient").innerText = data.ambient;
             document.getElementById("humidity").innerText = data.humidity;
             document.getElementById("glass").innerText = data.glass;
@@ -645,6 +710,13 @@ void setupWebServer() {
             const heaterButton = document.getElementById("heaterButton");
             if (heaterOn) { heaterButton.innerText = "Turn Heater OFF"; }
             else { heaterButton.innerText = "Turn Heater ON"; }
+          }).catch(error => {
+            // Update WiFi status - disconnected
+            const wifiStatus = document.getElementById("wifiStatus");
+            wifiStatus.innerText = "📶 Disconnected";
+            wifiStatus.style.backgroundColor = "#ffcccc";
+            wifiStatus.style.color = "#666";
+            console.log('Status update failed:', error);
           });
         }
 
@@ -729,7 +801,7 @@ void setupWebServer() {
         setInterval(() => { 
           updateStatus();
           if (!logPaused) updateLog();
-        }, 3000);
+        }, )rawliteral" + String(WIFI_STATUS_CHECK_INTERVAL_MS) + R"rawliteral();
 
         window.onload = () => { updateStatus(); updateLog(); };
 
@@ -738,6 +810,7 @@ void setupWebServer() {
       <h2 style="padding:10px">
         Dew Heater Controller 
         <span id="version" style="font-size: 0.6em; color: #666;"></span>
+        <span id="wifiStatus" style="float: right; font-size: 0.8em; padding: 5px 10px; border-radius: 4px; background-color: #ffcccc; color: #666;">📶 Disconnected</span>
       </h2>
       <div id="main">
         <div id="status">
@@ -822,8 +895,30 @@ void setupWebServer() {
   // ---- JSON/status and control endpoints ----
 
   server.on("/status.json", []() {
+    // Get cached values updated by background task
+    float cached_td_local, cached_spread_local;
+    String cached_calFileSize_local, cached_storageInfo_local;
+    int cached_rssi_local;
+    
+    if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(5))) {
+      cached_td_local = cached_td;
+      cached_spread_local = cached_spread;
+      cached_calFileSize_local = cached_calFileSize;
+      cached_storageInfo_local = cached_storageInfo;
+      cached_rssi_local = cached_rssi;
+      xSemaphoreGive(cacheMutex);
+    } else {
+      // Fallback values if mutex fails
+      cached_td_local = NAN;
+      cached_spread_local = NAN;
+      cached_calFileSize_local = "0 KB";
+      cached_storageInfo_local = "0/0 KB";
+      cached_rssi_local = -99;
+    }
+
+    // Fast path - just get current values
     float t, h;
-    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(2))) {
       t = ambientTemp;
       h = humidity;
       xSemaphoreGive(i2cMutex);
@@ -833,33 +928,61 @@ void setupWebServer() {
     }
 
     float delta = glassTemp - t;
-    float td = dewPointC(t, h);
-    float spread = isnan(td) ? NAN : (t - td);
     int pwmPercent = pwm * 100 / 255;
 
-    StaticJsonDocument<256> doc;
-    doc["ambient"] = String(t, 1);
-    doc["humidity"] = String(h, 1);
-    doc["dewpoint"] = isnan(td) ? String("NaN") : String(td, 1);
-    doc["dewspread"] = isnan(spread) ? String("NaN") : String(spread, 1);
-    doc["glass"] = String(glassTemp, 1);
-    doc["delta"] = String(delta, 1);
-    doc["heater"] = heaterEnabled;
-    doc["pwm"] = pwmPercent;
-    doc["calibrating"] = calibrating;
-    doc["calibrationFileSize"] = getCalibrationFileSizeKB(CALIBRATION_FILE);
-    doc["storageInfo"] = getStorageUsedSummary();
-    doc["version"] = DEVICE_VERSION;
-    doc["dewSpreadThreshold"] = String(dewSpreadThreshold, 1);
-    doc["dewSpreadHysteresis"] = String(dewSpreadHysteresis, 1);
-
-    String json;
-    serializeJson(doc, json);
+    // Simplified JSON response - avoid heavy String operations
+    String json = "{";
+    json += "\"ambient\":\"" + String(t, 1) + "\",";
+    json += "\"humidity\":\"" + String(h, 1) + "\",";
+    json += "\"dewpoint\":\"" + (isnan(cached_td_local) ? "NaN" : String(cached_td_local, 1)) + "\",";
+    json += "\"dewspread\":\"" + (isnan(cached_spread_local) ? "NaN" : String(cached_spread_local, 1)) + "\",";
+    json += "\"glass\":\"" + String(glassTemp, 1) + "\",";
+    json += "\"delta\":\"" + String(delta, 1) + "\",";
+    json += "\"heater\":" + String(heaterEnabled ? "true" : "false") + ",";
+    json += "\"pwm\":" + String(pwmPercent) + ",";
+    json += "\"calibrating\":" + String(calibrating ? "true" : "false") + ",";
+    json += "\"calibrationFileSize\":\"" + cached_calFileSize_local + "\",";
+    json += "\"storageInfo\":\"" + cached_storageInfo_local + "\",";
+    json += "\"version\":\"" + String(DEVICE_VERSION) + "\",";
+    json += "\"dewSpreadThreshold\":\"" + String(dewSpreadThreshold, 1) + "\",";
+    json += "\"dewSpreadHysteresis\":\"" + String(dewSpreadHysteresis, 1) + "\",";
+    json += "\"wifiSignal\":" + String(cached_rssi_local);
+    json += "}";
+    
     server.send(200, "application/json; charset=UTF-8", json);
   });
 
   server.on("/log", []() {
-    server.send(200, "text/plain", logBuffer);
+    if (server.hasArg("full")) {
+      // Full log requested explicitly
+      server.send(200, "text/plain", logBuffer);
+    } else {
+      // Send only recent log entries to reduce network load
+      String recentLog = "";
+      int bufferLen = logBuffer.length();
+      
+      if (bufferLen > 3072) {  // 3KB threshold
+        // Find the last 2KB but ensure we start at a complete line
+        int startPos = bufferLen - 2048;
+        
+        // Yield during string processing to allow system message pump
+        yield();
+        
+        // Find the next newline to avoid cutting lines in half
+        int nextNewline = logBuffer.indexOf('\n', startPos);
+        if (nextNewline != -1 && nextNewline < bufferLen - 1) {
+          startPos = nextNewline + 1;  // Start after the newline
+        }
+        
+        yield(); // Yield before substring operation
+        recentLog = logBuffer.substring(startPos);
+      } else {
+        // Buffer is small enough, send it all
+        recentLog = logBuffer;
+      }
+      
+      server.send(200, "text/plain", recentLog);
+    }
   });
 
   server.on("/toggle", HTTP_POST, []() {
@@ -920,9 +1043,15 @@ void setupWebServer() {
       sendLog("❌ No calibration data found.");
     } else {
       sendLog("📈 Calibration Data:");
+      int lineCount = 0;
       while (f.available()) {
         String line = f.readStringUntil('\n');
         sendLog("📌 " + line);
+        
+        // Yield every 10 lines to prevent blocking
+        if (++lineCount % 10 == 0) {
+          yield();
+        }
       }
       f.close();
     }
@@ -1042,7 +1171,7 @@ void sensorTask_SHT40(void* parameter) {
     sht4.getEvent(&humidity_event, &temp_event);
 
     if (!isnan(temp_event.temperature) && !isnan(humidity_event.relative_humidity)) {
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5))) {
         ambientTemp = temp_event.temperature;
         humidity = humidity_event.relative_humidity;
         xSemaphoreGive(i2cMutex);
@@ -1050,7 +1179,153 @@ void sensorTask_SHT40(void* parameter) {
     } else {
       sendLog("⚠️ SHT40 returned bad data");
     }
-    delay(2000);
+    
+    // Yield to other tasks more frequently
+    yield();
+    delay(3000);  // Longer delay to reduce I2C traffic
+  }
+}
+
+// Network task - Core 1: Pure network connectivity and messaging
+void networkTask(void* parameter) {
+  sendLog("🧵 Network task started on core " + String(xPortGetCoreID()));
+
+  unsigned long lastWiFiCheck = 0;
+  unsigned long lastNTPCheck = 0;
+  unsigned long lastRSSIUpdate = 0;
+  
+  for (;;) {
+    // Handle web requests efficiently - user mostly views auto-refresh status
+    server.handleClient();
+    yield();
+    
+    handleLEDStatus();
+    
+    unsigned long now = millis();
+    
+    // Handle WiFi reconnect every 10 seconds
+    if (now - lastWiFiCheck >= 10000) {
+      lastWiFiCheck = now;
+      handleWiFiReconnect();
+    }
+    
+    // Handle NTP every 2 minutes
+    if (now - lastNTPCheck >= 120000) {
+      lastNTPCheck = now;
+      handleNTP();
+    }
+    
+    // Update RSSI every 2 minutes
+    if (now - lastRSSIUpdate >= 120000) {
+      lastRSSIUpdate = now;
+      int rssi = WiFi.RSSI();
+      
+      // Update cached RSSI value
+      if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1))) {
+        cached_rssi = rssi;
+        xSemaphoreGive(cacheMutex);
+      }
+    }
+    
+    // Network task cycle - balance responsiveness with CPU efficiency
+    delay(25);
+  }
+}
+
+// Application task - Core 0: Pure application logic
+void applicationTask(void* parameter) {
+  sendLog("🧵 Application task started on core " + String(xPortGetCoreID()));
+
+  unsigned long lastUpdate = 0;
+  unsigned long lastCalibrationUpdate = 0;
+  unsigned long lastFileCheck = 0;
+  unsigned long lastThermalLog = 0;
+  
+  // Initialize cache immediately on startup
+  delay(2000);  // Wait for sensor to stabilize
+  float t = ambientTemp;
+  float h = humidity;
+  float td = dewPointC(t, h);
+  float spread = isnan(td) ? NAN : (t - td);
+  String calFileSize = getCalibrationFileSizeKB(CALIBRATION_FILE);
+  String storageInfo = getStorageUsedSummary();
+  
+  if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(10))) {
+    cached_td = td;
+    cached_spread = spread;
+    cached_calFileSize = calFileSize;
+    cached_storageInfo = storageInfo;
+    cached_rssi = WiFi.RSSI();
+    lastCacheUpdate = millis();
+    xSemaphoreGive(cacheMutex);
+  }
+  
+  for (;;) {
+    unsigned long now = millis();
+    
+    // Main application cycle every second
+    if (now - lastUpdate >= 1000) {
+      lastUpdate = now;
+      
+#if SIMULATE_HARDWARE
+      simulateHardware();
+#endif
+      updateGlassTemp();
+      updateHeaterControl();
+    }
+    
+    // Calibration every 10 seconds (less frequent)
+    if (now - lastCalibrationUpdate >= 10000) {
+      lastCalibrationUpdate = now;
+      updateCalibration();
+    }
+    
+    // File operations and caching every 10 minutes (even less frequent)
+    if (now - lastFileCheck > 600000) {
+      // Update dew point calculations
+      float t, h;
+      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(1))) {
+        t = ambientTemp;
+        h = humidity;
+        xSemaphoreGive(i2cMutex);
+      } else {
+        t = ambientTemp;
+        h = humidity;
+      }
+      
+      // Fast calculations (no network operations here)
+      float td = dewPointC(t, h);
+      float spread = isnan(td) ? NAN : (t - td);
+      
+      // Yield before file operations
+      yield();
+      
+      // File operations
+      String calFileSize = getCalibrationFileSizeKB(CALIBRATION_FILE);
+      yield(); // Yield between file operations
+      String storageInfo = getStorageUsedSummary();
+      
+      // Update cached values with shorter timeout
+      if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1))) {
+        cached_td = td;
+        cached_spread = spread;
+        cached_calFileSize = calFileSize;
+        cached_storageInfo = storageInfo;
+        lastCacheUpdate = millis();
+        xSemaphoreGive(cacheMutex);
+      }
+      
+      lastFileCheck = now;
+    }
+    
+    // Thermal lag logging every 10 minutes (less frequent)
+    if (now - lastThermalLog >= 600000) {
+      lastThermalLog = now;
+      logThermalLagInfo();
+    }
+    
+    // Application task runs much slower to give network maximum priority - 1500ms cycle
+    delay(1500);
   }
 }
 
@@ -1118,11 +1393,11 @@ void handleWiFiReconnect() {
   lastReconnectAttempt = now;
 
   // Helper lambda for hostname reapplication before connecting (TPG compatible)
-  auto reapplyHostname = []() {
+    auto reapplyHostname = []() {
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (netif) {
       esp_netif_dhcpc_stop(netif);
-      delay(100);  // TPG routers need extra time
+      delay(50);  // Reduced delay - TPG routers should work with less
       esp_netif_set_hostname(netif, "DewController");
       esp_netif_dhcpc_start(netif);
       sendLog("🏷 Hostname reapplied for TPG router: DewController");
@@ -1135,9 +1410,7 @@ void handleWiFiReconnect() {
     wifi_config_t wifi_config;
     esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
     memset(&wifi_config, 0, sizeof(wifi_config_t));
-  };
-
-  // --- Reconnect attempts depending on mode ---
+  };  // --- Reconnect attempts depending on mode ---
   if (mode == WIFI_AP) {
     sendLog("🔁 STA retry while in AP mode (WIFI_AP_STA)...");
     WiFi.mode(WIFI_AP_STA);
@@ -1326,33 +1599,19 @@ void updateCalibration() {
   }
 }
 
-// Check if NTP has synced; retry if not, and detect DST changes (AEST/AEDT)
+// Check if NTP has synced; only once per session
 void handleNTP() {
-  static unsigned long lastCheck = 0;
   static bool timeSynced = false;
-  static String lastTZ = "";
 
-  if (millis() - lastCheck < 30000) return;  // check every 30s
-  lastCheck = millis();
+  // Only check until first successful sync
+  if (timeSynced) return;
 
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
     char buf[64];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
-    String tzName = String(timeinfo.tm_isdst ? "AEDT" : "AEST");  // fallback label
-
-    // --- First successful sync ---
-    if (!timeSynced) {
-      sendLog(String("✅ NTP time synchronized: ") + buf);
-      lastTZ = tzName;
-      timeSynced = true;
-    }
-
-    // --- Detect DST transition ---
-    if (tzName != lastTZ && lastTZ != "") {
-      sendLog(String("🕒 Daylight Saving Time change detected: ") + lastTZ + " → " + tzName);
-      lastTZ = tzName;
-    }
+    sendLog(String("✅ NTP time synchronized: ") + buf);
+    timeSynced = true;  // Stop checking once synced
   } 
   else {
     sendLog("⚠️ NTP not yet synchronized, retrying...");
@@ -1388,38 +1647,59 @@ void setup() {
   setupWiFi();
 
   i2cMutex = xSemaphoreCreateMutex();
+  cacheMutex = xSemaphoreCreateMutex();
+  
+  // Core 1: Network connectivity and messaging (lower priority to avoid conflicts)
+  xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 1, &networkTaskHandle, 1);
+  sendLog("🧵 Network task created on core 1");
+  
+  // Core 0: Application logic (normal priority)
+  xTaskCreatePinnedToCore(applicationTask, "ApplicationTask", 4096, NULL, 1, &applicationTaskHandle, 0);
+  sendLog("🧵 Application task created on core 0");
+  
+  // Core 0: Sensor tasks
   if (sensorSource == SOURCE_SHT40) {
-    xTaskCreatePinnedToCore(sensorTask_SHT40, "SensorTask_SHT40", 4096, NULL, 1, &sensorTaskHandle, 1);
-    sendLog("📡 Using SHT40 sensor");
+    xTaskCreatePinnedToCore(sensorTask_SHT40, "SensorTask_SHT40", 4096, NULL, 1, &sensorTaskHandle, 0);
+    sendLog("📡 Using SHT40 sensor on core 0");
   } else if (sensorSource == SOURCE_WEATHER) {
-    xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 1);
-    sendLog("📡 Using Weather station");
+    xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 0);
+    sendLog("📡 Using Weather station on core 0");
   } else {  // SOURCE_AHT20
-    xTaskCreatePinnedToCore(sensorTask_AHT20, "SensorTask_AHT20", 4096, NULL, 1, &sensorTaskHandle, 1);
-    sendLog("📡 Using AHT20 sensor");
+    xTaskCreatePinnedToCore(sensorTask_AHT20, "SensorTask_AHT20", 4096, NULL, 1, &sensorTaskHandle, 0);
+    sendLog("📡 Using AHT20 sensor on core 0");
   }
-  delay(500);
+  
+  sendLog("🏗 Dual-core architecture initialized:");
+  sendLog("   Core 1: Network, WiFi, Web Server, mDNS, NTP");
+  sendLog("   Core 0: Sensors, Heater Control, Calibration, File I/O");
+  delayWithYield(500);
 }
 
 // ---------------- Loop ----------------
-unsigned long lastUpdate = 0;
-
 void loop() {
+  // Keep main loop minimal - just handle a few network requests to help
   server.handleClient();
-  handleWiFiReconnect();
-  handleLEDStatus();
-
-  if (millis() - lastUpdate >= LOOP_INTERVAL_MS) {
-    lastUpdate = millis();
-
-#if SIMULATE_HARDWARE
-    simulateHardware();
-#endif
-    updateGlassTemp();
-    updateHeaterControl();
-    updateCalibration();
-    logThermalLagInfo();
-    handleNTP();
+  yield();
+  server.handleClient();
+  
+  // Monitor task health every 60 seconds (less frequent)
+  static unsigned long lastHealthCheck = 0;
+  if (millis() - lastHealthCheck > 60000) {
+    lastHealthCheck = millis();
+    
+    // Check if critical tasks are still running
+    if (networkTaskHandle && eTaskGetState(networkTaskHandle) == eDeleted) {
+      sendLog("⚠️ Network task died - system restart required");
+      ESP.restart();
+    }
+    if (applicationTaskHandle && eTaskGetState(applicationTaskHandle) == eDeleted) {
+      sendLog("⚠️ Application task died - system restart required");
+      ESP.restart();
+    }
+    
+    // Network status is displayed in web page header - no logging needed
   }
-  delay(100); // or yield(), to give time to background tasks
+  
+  // Faster main loop - reduce delay to 100ms
+  delay(100);
 }
