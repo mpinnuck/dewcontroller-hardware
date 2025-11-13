@@ -20,7 +20,7 @@
 #include <HTTPClient.h>
 #include <math.h>
 
-#define DEVICE_VERSION "v2.7.1"
+#define DEVICE_VERSION "v2.7.2"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -28,7 +28,21 @@
 #define CALIBRATION_FILE "/calibration.csv"
 #define LOOP_INTERVAL_MS 1000
 #define WEATHER_POLL_INTERVAL_MS 5 * 60 * 1000 // 300000 ms or 5 minutes
-#define WIFI_STATUS_CHECK_INTERVAL_MS 20000 // 20 seconds
+#define WIFI_STATUS_CHECK_INTERVAL_MS 5000 // 5 seconds - faster disconnect detection
+
+// Network task timing constants
+#define WIFI_RECONNECT_INTERVAL_MS 10000  // 10 seconds
+#define NTP_CHECK_INTERVAL_MS 120000      // 2 minutes
+#define RSSI_UPDATE_INTERVAL_MS 120000    // 2 minutes
+#define TASK_HEALTH_CHECK_INTERVAL_MS 60000  // 1 minute
+#define NETWORK_LOOP_DELAY_MS 25          // Core 1 loop cycle time
+
+// Application task timing constants
+#define APP_UPDATE_INTERVAL_MS 1000       // 1 second - main control loop
+#define CALIBRATION_UPDATE_INTERVAL_MS 10000  // 10 seconds
+#define FILE_CACHE_UPDATE_INTERVAL_MS 600000  // 10 minutes
+#define THERMAL_LOG_INTERVAL_MS 600000    // 10 minutes
+#define APP_LOOP_DELAY_MS 1500            // Core 0 task cycle time
 
 #define I2C_SDA 5
 #define I2C_SCL 6
@@ -71,6 +85,7 @@ SensorSource sensorSource = SOURCE_SHT40;  // default
 
 SemaphoreHandle_t   i2cMutex;
 SemaphoreHandle_t   cacheMutex;
+SemaphoreHandle_t   logMutex;
 TaskHandle_t        sensorTaskHandle;
 TaskHandle_t        backgroundTaskHandle;
 TaskHandle_t        networkTaskHandle;
@@ -110,7 +125,7 @@ const unsigned long CAL_SAMPLE_INTERVAL_MS = 30000;  // 30 seconds
 unsigned long lastCalSampleTime = 0;
 bool    firstCalSample = true;  // header line
 
-const int MAX_LOG_SIZE = 16384;
+const int MAX_LOG_SIZE = 65536;  // 64KB log buffer - keep more startup history
 String  logBuffer;
 
 bool ntpInitialized = false;
@@ -126,6 +141,7 @@ unsigned long lastCacheUpdate = 0;
 // Forward declarations
 void setupNTP();
 void setupWebServer();
+void handleNTP(bool forceCheck = false);
 
 
 // -------------- Utility --------------
@@ -222,20 +238,31 @@ float dewPointC(float T, float RH) {
 }
 
 void sendLog(const String& msg) {
-  static char lastTimeStr[32] = "??";
+  static char timeStr[32];
   struct tm timeinfo;
 
-  // Use current local time if available
+  // Use current local time if available, otherwise show boot time
   if (getLocalTime(&timeinfo, 50)) {  // short timeout
-    strftime(lastTimeStr, sizeof(lastTimeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  } else {
+    // Before NTP sync, show time since boot
+    unsigned long secs = millis() / 1000;
+    snprintf(timeStr, sizeof(timeStr), "+%lus", secs);
   }
 
-  String logLine = "[" + String(lastTimeStr) + "] " + msg;
+  String logLine = "[" + String(timeStr) + "] " + msg;
   DEBUG_PRINT(logLine);
 
-  logBuffer += logLine + "\n";
-  if (logBuffer.length() > MAX_LOG_SIZE) {
-    logBuffer = logBuffer.substring(logBuffer.length() - MAX_LOG_SIZE);
+  // Protect logBuffer from concurrent access by multiple cores/tasks
+  if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(100))) {
+    logBuffer += logLine + "\n";
+    if (logBuffer.length() > MAX_LOG_SIZE) {
+      logBuffer = logBuffer.substring(logBuffer.length() - MAX_LOG_SIZE);
+    }
+    xSemaphoreGive(logMutex);
+  } else {
+    // If mutex not available yet (early startup) or timeout, just print to serial
+    DEBUG_PRINT("⚠️ Log mutex unavailable");
   }
 }
 
@@ -481,13 +508,6 @@ void setupWiFi() {
 
   // Set Arduino layer hostname
   WiFi.setHostname("DewController");
-  
-  // Additional TPG router compatibility - set WiFi config hostname
-  wifi_config_t wifi_config;
-  esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
-  // Clear any cached data that might interfere
-  memset(&wifi_config, 0, sizeof(wifi_config_t));
-  sendLog("🔧 WiFi config cleared for TPG router compatibility");
 
   // --- Step 2: Begin initial connection ---
   WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
@@ -524,6 +544,7 @@ void setupWiFi() {
       sendLog("❌ mDNS failed to start!");
     } else {
       sendLog("✅ mDNS responder started as DewController.local");
+      yield();
     }
 
     // Initialize NTP only once
@@ -562,6 +583,7 @@ void setupWiFi() {
       sendLog("❌ mDNS failed to start!");
     } else {
       sendLog("✅ mDNS responder started as DewController.local");
+      yield();
     }
 
     applyLocalTimezone();
@@ -650,8 +672,15 @@ void setupWebServer() {
         let logPaused = false;
 
         function updateStatus() {
-          fetch('/status.json').then(r => r.json()).then(data => {
-            // Update WiFi status - connected with signal strength and color coding
+          // Add 3 second timeout for faster disconnect detection
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 3000);
+          
+          fetch('/status.json', { signal: controller.signal })
+            .then(r => r.json())
+            .then(data => {
+              clearTimeout(timeoutId);
+              // Update WiFi status - connected with signal strength and color coding
             const wifiStatus = document.getElementById("wifiStatus");
             const signal = parseInt(data.wifiSignal) || 0;
             
@@ -731,7 +760,7 @@ void setupWebServer() {
         }
 
         function updateLog() {
-          fetch('/log').then(r => r.text()).then(data => {
+          fetch('/log?full=1').then(r => r.text()).then(data => {
             const box = document.getElementById("log");
             box.innerText = data;
             box.scrollTop = box.scrollHeight;
@@ -949,6 +978,9 @@ void setupWebServer() {
     json += "\"wifiSignal\":" + String(cached_rssi_local);
     json += "}";
     
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
     server.send(200, "application/json; charset=UTF-8", json);
   });
 
@@ -981,6 +1013,9 @@ void setupWebServer() {
         recentLog = logBuffer;
       }
       
+      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      server.sendHeader("Pragma", "no-cache");
+      server.sendHeader("Expires", "0");
       server.send(200, "text/plain", recentLog);
     }
   });
@@ -1186,51 +1221,7 @@ void sensorTask_SHT40(void* parameter) {
   }
 }
 
-// Network task - Core 1: Pure network connectivity and messaging
-void networkTask(void* parameter) {
-  sendLog("🧵 Network task started on core " + String(xPortGetCoreID()));
-
-  unsigned long lastWiFiCheck = 0;
-  unsigned long lastNTPCheck = 0;
-  unsigned long lastRSSIUpdate = 0;
-  
-  for (;;) {
-    // Handle web requests efficiently - user mostly views auto-refresh status
-    server.handleClient();
-    yield();
-    
-    handleLEDStatus();
-    
-    unsigned long now = millis();
-    
-    // Handle WiFi reconnect every 10 seconds
-    if (now - lastWiFiCheck >= 10000) {
-      lastWiFiCheck = now;
-      handleWiFiReconnect();
-    }
-    
-    // Handle NTP every 2 minutes
-    if (now - lastNTPCheck >= 120000) {
-      lastNTPCheck = now;
-      handleNTP();
-    }
-    
-    // Update RSSI every 2 minutes
-    if (now - lastRSSIUpdate >= 120000) {
-      lastRSSIUpdate = now;
-      int rssi = WiFi.RSSI();
-      
-      // Update cached RSSI value
-      if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1))) {
-        cached_rssi = rssi;
-        xSemaphoreGive(cacheMutex);
-      }
-    }
-    
-    // Network task cycle - balance responsiveness with CPU efficiency
-    delay(25);
-  }
-}
+// Network task eliminated - now runs directly in loop() on Core 1 without task overhead
 
 // Application task - Core 0: Pure application logic
 void applicationTask(void* parameter) {
@@ -1241,22 +1232,34 @@ void applicationTask(void* parameter) {
   unsigned long lastFileCheck = 0;
   unsigned long lastThermalLog = 0;
   
-  // Initialize cache immediately on startup
+  // Initialize cache immediately on startup - calculations only, no file I/O yet
   delay(2000);  // Wait for sensor to stabilize
   float t = ambientTemp;
   float h = humidity;
   float td = dewPointC(t, h);
   float spread = isnan(td) ? NAN : (t - td);
-  String calFileSize = getCalibrationFileSizeKB(CALIBRATION_FILE);
-  String storageInfo = getStorageUsedSummary();
   
   if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(10))) {
     cached_td = td;
     cached_spread = spread;
-    cached_calFileSize = calFileSize;
-    cached_storageInfo = storageInfo;
+    // File-based cache values will be updated on first cycle
+    cached_calFileSize = "-- KB";
+    cached_storageInfo = "--/-- KB";
     cached_rssi = WiFi.RSSI();
     lastCacheUpdate = millis();
+    xSemaphoreGive(cacheMutex);
+  }
+  
+  // Update file-based cache values on first safe opportunity
+  delay(1000);  // Brief delay to ensure filesystem is stable
+  yield();
+  String calFileSize = getCalibrationFileSizeKB(CALIBRATION_FILE);
+  yield();
+  String storageInfo = getStorageUsedSummary();
+  
+  if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(10))) {
+    cached_calFileSize = calFileSize;
+    cached_storageInfo = storageInfo;
     xSemaphoreGive(cacheMutex);
   }
   
@@ -1264,7 +1267,7 @@ void applicationTask(void* parameter) {
     unsigned long now = millis();
     
     // Main application cycle every second
-    if (now - lastUpdate >= 1000) {
+    if (now - lastUpdate >= APP_UPDATE_INTERVAL_MS) {
       lastUpdate = now;
       
 #if SIMULATE_HARDWARE
@@ -1275,13 +1278,13 @@ void applicationTask(void* parameter) {
     }
     
     // Calibration every 10 seconds (less frequent)
-    if (now - lastCalibrationUpdate >= 10000) {
+    if (now - lastCalibrationUpdate >= CALIBRATION_UPDATE_INTERVAL_MS) {
       lastCalibrationUpdate = now;
       updateCalibration();
     }
     
     // File operations and caching every 10 minutes (even less frequent)
-    if (now - lastFileCheck > 600000) {
+    if (now - lastFileCheck > FILE_CACHE_UPDATE_INTERVAL_MS) {
       // Update dew point calculations
       float t, h;
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(1))) {
@@ -1319,13 +1322,13 @@ void applicationTask(void* parameter) {
     }
     
     // Thermal lag logging every 10 minutes (less frequent)
-    if (now - lastThermalLog >= 600000) {
+    if (now - lastThermalLog >= THERMAL_LOG_INTERVAL_MS) {
       lastThermalLog = now;
       logThermalLagInfo();
     }
     
     // Application task runs much slower to give network maximum priority - 1500ms cycle
-    delay(1500);
+    delay(APP_LOOP_DELAY_MS);
   }
 }
 
@@ -1360,6 +1363,7 @@ void handleWiFiReconnect() {
         sendLog("❌ Failed to restart mDNS responder!");
       } else {
         sendLog("✅ mDNS responder restarted as DewController.local");
+        yield();
       }
 
       server.stop();
@@ -1375,6 +1379,9 @@ void handleWiFiReconnect() {
       } else {
         sendLog("⏱ NTP already active — skipping reinit");
       }
+      
+      // Immediately attempt NTP sync after reconnection
+      handleNTP(true);
     }
     return;
   }
@@ -1392,55 +1399,45 @@ void handleWiFiReconnect() {
   if (now - lastReconnectAttempt < reconnectIntervalMs) return;
   lastReconnectAttempt = now;
 
-  // Helper lambda for hostname reapplication before connecting (TPG compatible)
-    auto reapplyHostname = []() {
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (netif) {
-      esp_netif_dhcpc_stop(netif);
-      delay(50);  // Reduced delay - TPG routers should work with less
-      esp_netif_set_hostname(netif, "DewController");
-      esp_netif_dhcpc_start(netif);
-      sendLog("🏷 Hostname reapplied for TPG router: DewController");
+  // Check current status - don't interrupt if connection is in progress
+  if (status == WL_IDLE_STATUS || status == WL_DISCONNECTED) {
+    // Connection attempt finished but failed - safe to retry
+    if (mode == WIFI_AP) {
+      sendLog("🔁 Retrying STA connection from AP mode...");
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
     } else {
-      sendLog("⚠️ Failed to reapply hostname — esp_netif not ready");
+      sendLog("🔁 Retrying WiFi connection...");
+      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
     }
-    WiFi.setHostname("DewController");
-    
-    // Clear WiFi config for TPG compatibility
-    wifi_config_t wifi_config;
-    esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
-    memset(&wifi_config, 0, sizeof(wifi_config_t));
-  };  // --- Reconnect attempts depending on mode ---
-  if (mode == WIFI_AP) {
-    sendLog("🔁 STA retry while in AP mode (WIFI_AP_STA)...");
-    WiFi.mode(WIFI_AP_STA);
-    reapplyHostname();
-    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
   }
-  else if (mode == WIFI_AP_STA || mode == WIFI_STA) {
-    sendLog("🔁 Attempting STA reconnect...");
-    WiFi.disconnect();
-    reapplyHostname();
-    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  else if (status == WL_NO_SSID_AVAIL || status == WL_CONNECT_FAILED) {
+    // Hard failure states - only after prolonged offline do a full reset
+    const unsigned long offlineResetMs = 90000; // 90s
+    if (offlineSince && (now - offlineSince > offlineResetMs)) {
+      sendLog("🧩 WiFi offline for >90s — performing hard reset...");
+      WiFi.disconnect(true, true);
+      delay(200);
+      WiFi.mode(WIFI_STA);
+      
+      esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+      if (netif) {
+        esp_netif_dhcpc_stop(netif);
+        delay(50);
+        esp_netif_set_hostname(netif, "DewController");
+        esp_netif_dhcpc_start(netif);
+      }
+      WiFi.setHostname("DewController");
+      
+      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+      offlineSince = now;  // Reset timer after hard reset
+    } else {
+      // Try again without disrupting the stack
+      sendLog("🔁 Retrying after connection failure...");
+      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+    }
   }
-  else {
-    sendLog("⚙️ Unexpected Wi-Fi mode, normalising to STA and reconnecting...");
-    WiFi.mode(WIFI_STA);
-    reapplyHostname();
-    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-  }
-
-  // Optional: after long offline duration, restart the interface more aggressively
-  const unsigned long offlineResetMs = 90000; // 90s
-  if (offlineSince && (now - offlineSince > offlineResetMs)) {
-    sendLog("🧩 Wi-Fi offline for >90 s — restarting interface...");
-    WiFi.disconnect(true, true);
-    delay(200);
-    WiFi.mode(WIFI_STA);
-    reapplyHostname();
-    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-    offlineSince = now;
-  }
+  // else: status is WL_SCAN_COMPLETED or other transient state - let it continue
 }
 
 void handleLEDStatus() {
@@ -1600,11 +1597,11 @@ void updateCalibration() {
 }
 
 // Check if NTP has synced; only once per session
-void handleNTP() {
+void handleNTP(bool forceCheck) {
   static bool timeSynced = false;
 
-  // Only check until first successful sync
-  if (timeSynced) return;
+  // Force check on reconnection, otherwise only check until first successful sync
+  if (!forceCheck && timeSynced) return;
 
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
@@ -1635,6 +1632,11 @@ void setup() {
   DEBUG_PRINT("🔍 Serial started at 115200 baud");
 #endif
 
+  // Create mutexes FIRST - before any logging or multi-threaded operations
+  i2cMutex = xSemaphoreCreateMutex();
+  cacheMutex = xSemaphoreCreateMutex();
+  logMutex = xSemaphoreCreateMutex();
+
   sendLog("🚀 Sketch started");
 
   pinMode(PWM_PIN, OUTPUT);
@@ -1645,15 +1647,8 @@ void setup() {
   loadConfig();
   applyLocalTimezone();
   setupWiFi();
-
-  i2cMutex = xSemaphoreCreateMutex();
-  cacheMutex = xSemaphoreCreateMutex();
   
-  // Core 1: Network connectivity and messaging (lower priority to avoid conflicts)
-  xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 1, &networkTaskHandle, 1);
-  sendLog("🧵 Network task created on core 1");
-  
-  // Core 0: Application logic (normal priority)
+  // Core 0: Application logic (runs independently on second core)
   xTaskCreatePinnedToCore(applicationTask, "ApplicationTask", 4096, NULL, 1, &applicationTaskHandle, 0);
   sendLog("🧵 Application task created on core 0");
   
@@ -1670,36 +1665,61 @@ void setup() {
   }
   
   sendLog("🏗 Dual-core architecture initialized:");
-  sendLog("   Core 1: Network, WiFi, Web Server, mDNS, NTP");
-  sendLog("   Core 0: Sensors, Heater Control, Calibration, File I/O");
+  sendLog("   Core 1: loop() - Network, WiFi, Web Server, mDNS, NTP");
+  sendLog("   Core 0: Application task - Sensors, Heater Control, Calibration, File I/O");
   delayWithYield(500);
 }
 
 // ---------------- Loop ----------------
 void loop() {
-  // Keep main loop minimal - just handle a few network requests to help
+  // Core 1 network operations - no task overhead
+  static unsigned long lastWiFiCheck = 0;
+  static unsigned long lastNTPCheck = 0;
+  static unsigned long lastRSSIUpdate = 0;
+  static unsigned long lastHealthCheck = 0;
+  
+  // Handle web requests efficiently
   server.handleClient();
   yield();
-  server.handleClient();
   
-  // Monitor task health every 60 seconds (less frequent)
-  static unsigned long lastHealthCheck = 0;
-  if (millis() - lastHealthCheck > 60000) {
-    lastHealthCheck = millis();
+  handleLEDStatus();
+  
+  unsigned long now = millis();
+  
+  // WiFi reconnect every 10 seconds
+  if (now - lastWiFiCheck >= WIFI_RECONNECT_INTERVAL_MS) {
+    lastWiFiCheck = now;
+    handleWiFiReconnect();
+  }
+  
+  // NTP every 2 minutes
+  if (now - lastNTPCheck >= NTP_CHECK_INTERVAL_MS) {
+    lastNTPCheck = now;
+    handleNTP();
+  }
+  
+  // Update RSSI every 2 minutes
+  if (now - lastRSSIUpdate >= RSSI_UPDATE_INTERVAL_MS) {
+    lastRSSIUpdate = now;
+    int rssi = WiFi.RSSI();
     
-    // Check if critical tasks are still running
-    if (networkTaskHandle && eTaskGetState(networkTaskHandle) == eDeleted) {
-      sendLog("⚠️ Network task died - system restart required");
-      ESP.restart();
+    if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1))) {
+      cached_rssi = rssi;
+      xSemaphoreGive(cacheMutex);
     }
+  }
+  
+  // Monitor task health every 60 seconds
+  if (now - lastHealthCheck > TASK_HEALTH_CHECK_INTERVAL_MS) {
+    lastHealthCheck = now;
+    
+    // Check if application task is still running
     if (applicationTaskHandle && eTaskGetState(applicationTaskHandle) == eDeleted) {
       sendLog("⚠️ Application task died - system restart required");
       ESP.restart();
     }
-    
-    // Network status is displayed in web page header - no logging needed
   }
   
-  // Faster main loop - reduce delay to 100ms
-  delay(100);
+  // Network loop cycle - balance responsiveness with CPU efficiency
+  delay(NETWORK_LOOP_DELAY_MS);
 }
