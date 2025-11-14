@@ -20,7 +20,7 @@
 #include <HTTPClient.h>
 #include <math.h>
 
-#define DEVICE_VERSION "v2.7.2"
+#define DEVICE_VERSION "v2.7.3"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -1321,11 +1321,11 @@ void applicationTask(void* parameter) {
       lastFileCheck = now;
     }
     
-    // Thermal lag logging every 10 minutes (less frequent)
-    if (now - lastThermalLog >= THERMAL_LOG_INTERVAL_MS) {
-      lastThermalLog = now;
-      logThermalLagInfo();
-    }
+    // Thermal lag logging disabled - uncomment if needed for debugging
+    // if (now - lastThermalLog >= THERMAL_LOG_INTERVAL_MS) {
+    //   lastThermalLog = now;
+    //   logThermalLagInfo();
+    // }
     
     // Application task runs much slower to give network maximum priority - 1500ms cycle
     delay(APP_LOOP_DELAY_MS);
