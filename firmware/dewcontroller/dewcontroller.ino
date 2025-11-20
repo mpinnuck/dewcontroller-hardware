@@ -20,7 +20,7 @@
 #include <HTTPClient.h>
 #include <math.h>
 
-#define DEVICE_VERSION "v2.7.3"
+#define DEVICE_VERSION "v2.7.4"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -30,19 +30,18 @@
 #define WEATHER_POLL_INTERVAL_MS 5 * 60 * 1000 // 300000 ms or 5 minutes
 #define WIFI_STATUS_CHECK_INTERVAL_MS 5000 // 5 seconds - faster disconnect detection
 
-// Network task timing constants
+// Main loop timing constants (Web/Network - runs in loop())
 #define WIFI_RECONNECT_INTERVAL_MS 10000  // 10 seconds
 #define NTP_CHECK_INTERVAL_MS 120000      // 2 minutes
 #define RSSI_UPDATE_INTERVAL_MS 120000    // 2 minutes
-#define TASK_HEALTH_CHECK_INTERVAL_MS 60000  // 1 minute
-#define NETWORK_LOOP_DELAY_MS 25          // Core 1 loop cycle time
-
-// Application task timing constants
-#define APP_UPDATE_INTERVAL_MS 1000       // 1 second - main control loop
-#define CALIBRATION_UPDATE_INTERVAL_MS 10000  // 10 seconds
 #define FILE_CACHE_UPDATE_INTERVAL_MS 600000  // 10 minutes
+#define MAIN_LOOP_DELAY_MS 25             // Main loop cycle time
+
+// Control task timing constants (Background - runs in task)
+#define APP_UPDATE_INTERVAL_MS 1000       // 1 second - heater control loop
+#define CALIBRATION_UPDATE_INTERVAL_MS 10000  // 10 seconds
 #define THERMAL_LOG_INTERVAL_MS 600000    // 10 minutes
-#define APP_LOOP_DELAY_MS 1500            // Core 0 task cycle time
+#define CONTROL_TASK_DELAY_MS 50          // Background control task cycle
 
 #define I2C_SDA 5
 #define I2C_SCL 6
@@ -66,7 +65,7 @@
 #define DEFAULT_DEWSPREAD     3.0
 #define DEWSPREAD_HYSTERISIS  1.0
 
-#define DEFAULT_TEMPDELTA     2.0
+#define DEFAULT_TEMPDELTA     4.0
 
 //#define DEBUG_MODE 1
 #if DEBUG_MODE
@@ -87,9 +86,7 @@ SemaphoreHandle_t   i2cMutex;
 SemaphoreHandle_t   cacheMutex;
 SemaphoreHandle_t   logMutex;
 TaskHandle_t        sensorTaskHandle;
-TaskHandle_t        backgroundTaskHandle;
-TaskHandle_t        networkTaskHandle;
-TaskHandle_t        applicationTaskHandle;
+TaskHandle_t        controlTaskHandle;
 WebServer           server(80);
 TwoWire             I2CBus = TwoWire(1);  // Dedicated I2C bus
 Adafruit_AHTX0      aht;
@@ -111,7 +108,7 @@ float glassCoeffA = GLASSCOEFFA;
 float glassCoeffB = GLASSCOEFFB;
 float glassCoeffC = GLASSCOEFFC;
 
-String  wifiSSID = "MicroConcepts-2G";
+String  wifiSSID = "";
 String  wifiPass = "";
 // Timezone rule for TZ environment (AEST/AEDT for Sydney by default)
 String  timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
@@ -238,7 +235,7 @@ float dewPointC(float T, float RH) {
 }
 
 void sendLog(const String& msg) {
-  static char timeStr[32];
+  char timeStr[32];  // Local buffer - not static to prevent corruption
   struct tm timeinfo;
 
   // Use current local time if available, otherwise show boot time
@@ -315,35 +312,41 @@ bool fetchOutdoorWeather(float* outTemp, float* outHumidity) {
 }
 
 void saveConfig() {
-  // Use a separate task for file I/O to avoid main loop blocking
-  xTaskCreate([](void* param) {
-    StaticJsonDocument<512> doc;
-    doc["delta"] = targetDelta;
-    doc["dewSpread"] = dewSpreadThreshold;         // NEW
-    doc["dewSpreadHysteresis"] = dewSpreadHysteresis; // NEW
-    doc["glassCoeffA"] = glassCoeffA;
-    doc["glassCoeffB"] = glassCoeffB;
-    doc["glassCoeffC"] = glassCoeffC;
-    doc["heater"] = heaterEnabled;
-    doc["ssid"] = wifiSSID;
-    doc["password"] = wifiPass;
-    doc["timezoneRule"] = timezoneRule;            // store full TZ rule
+  // Synchronous save with atomic write to prevent corruption
+  StaticJsonDocument<512> doc;
+  doc["delta"] = targetDelta;
+  doc["dewSpread"] = dewSpreadThreshold;
+  doc["dewSpreadHysteresis"] = dewSpreadHysteresis;
+  doc["glassCoeffA"] = glassCoeffA;
+  doc["glassCoeffB"] = glassCoeffB;
+  doc["glassCoeffC"] = glassCoeffC;
+  doc["heater"] = heaterEnabled;
+  doc["ssid"] = wifiSSID;
+  doc["password"] = wifiPass;
+  doc["timezoneRule"] = timezoneRule;
 
-    yield(); // Yield before file operations
-    
-    File file = SPIFFS.open(CONFIG_FILE, FILE_WRITE);
-    if (file) {
-      yield(); // Yield before serialization
-      serializeJson(doc, file);
-      yield(); // Yield after serialization
-      file.close();
-      sendLog("💾 Config saved");
-    } else {
-      sendLog("❌ Failed to save config");
-    }
-    
-    vTaskDelete(NULL); // Clean up task
-  }, "SaveConfigTask", 2048, NULL, 1, NULL);
+  // Write to temporary file first (atomic operation)
+  const char* tempFile = "/config.tmp";
+  File file = SPIFFS.open(tempFile, FILE_WRITE);
+  if (!file) {
+    sendLog("❌ Failed to open temp config file");
+    return;
+  }
+  
+  size_t bytesWritten = serializeJson(doc, file);
+  file.close();
+  
+  if (bytesWritten == 0) {
+    sendLog("❌ Failed to write config");
+    SPIFFS.remove(tempFile);
+    return;
+  }
+  
+  // Atomic rename - if this fails, old config is still intact
+  SPIFFS.remove(CONFIG_FILE);
+  SPIFFS.rename(tempFile, CONFIG_FILE);
+  
+  sendLog("💾 Config saved (" + String(bytesWritten) + " bytes)");
 }
 
 void loadConfig() {
@@ -364,6 +367,13 @@ void loadConfig() {
 
   if (err) {
     sendLog("❌ Failed to parse config: " + String(err.c_str()));
+    
+    // Delete corrupted config file and use defaults
+    if (err == DeserializationError::EmptyInput || err == DeserializationError::InvalidInput) {
+      sendLog("🗑 Deleting corrupted config file");
+      SPIFFS.remove(CONFIG_FILE);
+      sendLog("⚠️ Using defaults - please reconfigure via web interface");
+    }
     return;
   }
 
@@ -377,8 +387,8 @@ void loadConfig() {
   }
 
   heaterEnabled       = doc["heater"]       | false;
-  wifiSSID            = doc["ssid"]         | "MicroConcepts-2G";
-  wifiPass            = doc["password"]     | "leanneannatinka";
+  wifiSSID            = doc["ssid"]         | "";
+  wifiPass            = doc["password"]     | "";
   timezoneRule        = doc["timezoneRule"] | "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 
   sendLog("✅ Config loaded from SPIFFS");
@@ -849,7 +859,7 @@ void setupWebServer() {
             <tr><td>🧮 Dew Point:</td>     <td><span id='dewpoint'>--</span> °C</td></tr>
             <tr><td>📉 Dew Spread:</td>    <td><span id='dewspread'>--</span> °C</td></tr>
             <tr><td>🔍 Glass:</td>         <td><span id='glass'>--</span> °C</td></tr>
-            <tr><td>📏 Delta (Tg - Ta):</td><td><span id='delta'>--</span> °C</td></tr>
+            <tr><td>📏 Delta (Tg - Td):</td><td><span id='delta'>--</span> °C</td></tr>
             <tr id="heaterRow"><td>🔌 Heater:</td> <td><span id='heater'>--</span></td></tr>
             <tr id="pwmRow"><td>🔥 Heating Power:</td> <td><span id='pwm'>--</span>%</td></tr>
             <tr><td>🗂 Calibration File:</td> <td><span id='calibrationFileSize'>--</span></td></tr>
@@ -860,7 +870,7 @@ void setupWebServer() {
         <div id="settings">
           <form action="/settings" method="POST">
             <div class="inputrow">
-              <label>Temperature Delta (°C):</label>
+              <label>Margin above Dew Point (°C):</label>
               <input name="delta" value=")rawliteral" + String(targetDelta, 1) + R"rawliteral(">
             </div>
             <div class="inputrow">
@@ -956,7 +966,7 @@ void setupWebServer() {
       h = humidity;
     }
 
-    float delta = glassTemp - t;
+    float delta = glassTemp - cached_td_local;  // Tg - Td (glass temp above dew point)
     int pwmPercent = pwm * 100 / 255;
 
     // Simplified JSON response - avoid heavy String operations
@@ -1221,52 +1231,24 @@ void sensorTask_SHT40(void* parameter) {
   }
 }
 
-// Network task eliminated - now runs directly in loop() on Core 1 without task overhead
-
-// Application task - Core 0: Pure application logic
-void applicationTask(void* parameter) {
-  sendLog("🧵 Application task started on core " + String(xPortGetCoreID()));
+// Control task - Background: Heater control, calibration
+void controlTask(void* parameter) {
+  sendLog("🧵 Control task started on core " + String(xPortGetCoreID()));
 
   unsigned long lastUpdate = 0;
   unsigned long lastCalibrationUpdate = 0;
-  unsigned long lastFileCheck = 0;
-  unsigned long lastThermalLog = 0;
+  unsigned long lastCacheUpdate_local = 0;
   
-  // Initialize cache immediately on startup - calculations only, no file I/O yet
-  delay(2000);  // Wait for sensor to stabilize
-  float t = ambientTemp;
-  float h = humidity;
-  float td = dewPointC(t, h);
-  float spread = isnan(td) ? NAN : (t - td);
+  // Wait for sensor to stabilize
+  delay(2000);
   
-  if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(10))) {
-    cached_td = td;
-    cached_spread = spread;
-    // File-based cache values will be updated on first cycle
-    cached_calFileSize = "-- KB";
-    cached_storageInfo = "--/-- KB";
-    cached_rssi = WiFi.RSSI();
-    lastCacheUpdate = millis();
-    xSemaphoreGive(cacheMutex);
-  }
-  
-  // Update file-based cache values on first safe opportunity
-  delay(1000);  // Brief delay to ensure filesystem is stable
-  yield();
-  String calFileSize = getCalibrationFileSizeKB(CALIBRATION_FILE);
-  yield();
-  String storageInfo = getStorageUsedSummary();
-  
-  if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(10))) {
-    cached_calFileSize = calFileSize;
-    cached_storageInfo = storageInfo;
-    xSemaphoreGive(cacheMutex);
-  }
+  // Force immediate cache update on startup, then every 2 minutes
+  lastCacheUpdate_local = millis() - RSSI_UPDATE_INTERVAL_MS;
   
   for (;;) {
     unsigned long now = millis();
     
-    // Main application cycle every second
+    // Main heater control loop every second
     if (now - lastUpdate >= APP_UPDATE_INTERVAL_MS) {
       lastUpdate = now;
       
@@ -1277,14 +1259,16 @@ void applicationTask(void* parameter) {
       updateHeaterControl();
     }
     
-    // Calibration every 10 seconds (less frequent)
+    // Calibration every 10 seconds
     if (now - lastCalibrationUpdate >= CALIBRATION_UPDATE_INTERVAL_MS) {
       lastCalibrationUpdate = now;
       updateCalibration();
     }
     
-    // File operations and caching every 10 minutes (even less frequent)
-    if (now - lastFileCheck > FILE_CACHE_UPDATE_INTERVAL_MS) {
+    // Update cache every 2 minutes
+    if (now - lastCacheUpdate_local >= RSSI_UPDATE_INTERVAL_MS) {
+      lastCacheUpdate_local = now;
+      
       // Update dew point calculations
       float t, h;
       if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(1))) {
@@ -1296,39 +1280,28 @@ void applicationTask(void* parameter) {
         h = humidity;
       }
       
-      // Fast calculations (no network operations here)
       float td = dewPointC(t, h);
       float spread = isnan(td) ? NAN : (t - td);
       
-      // Yield before file operations
       yield();
-      
-      // File operations
       String calFileSize = getCalibrationFileSizeKB(CALIBRATION_FILE);
-      yield(); // Yield between file operations
+      yield();
       String storageInfo = getStorageUsedSummary();
+      int rssi = WiFi.RSSI();
       
-      // Update cached values with shorter timeout
       if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1))) {
         cached_td = td;
         cached_spread = spread;
         cached_calFileSize = calFileSize;
         cached_storageInfo = storageInfo;
+        cached_rssi = rssi;
         lastCacheUpdate = millis();
         xSemaphoreGive(cacheMutex);
       }
-      
-      lastFileCheck = now;
     }
     
-    // Thermal lag logging disabled - uncomment if needed for debugging
-    // if (now - lastThermalLog >= THERMAL_LOG_INTERVAL_MS) {
-    //   lastThermalLog = now;
-    //   logThermalLagInfo();
-    // }
-    
-    // Application task runs much slower to give network maximum priority - 1500ms cycle
-    delay(APP_LOOP_DELAY_MS);
+    // Control task cycle time
+    delay(CONTROL_TASK_DELAY_MS);
   }
 }
 
@@ -1495,29 +1468,35 @@ void updateHeaterControl() {
     t = ambientTemp;
   }
 
-  float delta = glassTemp - t;
-  float error = targetDelta - delta;
-
-  // ---- Gate by dew spread (Ta - Td) with hysteresis ----
+  // ---- Calculate dew point and control target ----
   float td = dewPointC(t, humidity);
   bool dewGate = false;
   static bool dewGateLatched = false; // on/off hysteresis latch
 
-  if (!isnan(td)) {
-    float spread = t - td;  // smaller spread => higher condensation risk
-    // ON when spread <= threshold; OFF when spread > threshold + hysteresis
-    if (!dewGateLatched && spread <= dewSpreadThreshold) {
-      dewGateLatched = true;
-    } else if (dewGateLatched && spread > (dewSpreadThreshold + dewSpreadHysteresis)) {
-      dewGateLatched = false;
-    }
-    dewGate = dewGateLatched;
-  } else {
+  if (isnan(td)) {
     // If dew point cannot be computed, fail-safe OFF
-    dewGate = false;
+    pwm = 0;
+    pwmIntegral = 0.0;
+    analogWrite(PWM_PIN, pwm);
+    return;
   }
 
+  float spread = t - td;  // smaller spread => higher condensation risk
+  
+  // Gate by dew spread with hysteresis
+  // ON when spread <= threshold; OFF when spread > threshold + hysteresis
+  if (!dewGateLatched && spread <= dewSpreadThreshold) {
+    dewGateLatched = true;
+  } else if (dewGateLatched && spread > (dewSpreadThreshold + dewSpreadHysteresis)) {
+    dewGateLatched = false;
+  }
+  dewGate = dewGateLatched;
+
   if (dewGate) {
+    // Control glass to be targetDelta °C ABOVE DEW POINT (not ambient)
+    float targetGlassTemp = td + targetDelta;
+    float error = targetGlassTemp - glassTemp;
+
     // PI control constants
     const float Kp = 50.0f;   // tune as needed
     const float Ki = 0.02f;
@@ -1538,8 +1517,8 @@ void updateHeaterControl() {
     // Clamp to allowed range
     int pwmValue = constrain(int(pwmValueF), PWM_MIN, PWM_MAX);
 
-    // If delta >= target, keep at least a small hold to stabilize glass
-    if ((glassTemp - t) >= targetDelta && pwmValue < PWM_MIN) {
+    // If glass already at target, maintain minimum hold for stability
+    if (glassTemp >= targetGlassTemp && pwmValue < PWM_MIN) {
       pwmValue = PWM_MIN;
     }
 
@@ -1648,43 +1627,48 @@ void setup() {
   applyLocalTimezone();
   setupWiFi();
   
-  // Core 0: Application logic (runs independently on second core)
-  xTaskCreatePinnedToCore(applicationTask, "ApplicationTask", 4096, NULL, 1, &applicationTaskHandle, 0);
-  sendLog("🧵 Application task created on core 0");
+  sendLog("🏗 Initializing architecture...");
+  sendLog("   Main loop: Web Server, WiFi, mDNS, NTP (foreground)");
+  sendLog("   Background tasks: Sensors, Heater Control, Calibration");
+  delayWithYield(100);
   
-  // Core 0: Sensor tasks
+  // Background: Sensor tasks
   if (sensorSource == SOURCE_SHT40) {
     xTaskCreatePinnedToCore(sensorTask_SHT40, "SensorTask_SHT40", 4096, NULL, 1, &sensorTaskHandle, 0);
-    sendLog("📡 Using SHT40 sensor on core 0");
+    sendLog("📡 SHT40 sensor task created");
   } else if (sensorSource == SOURCE_WEATHER) {
     xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 0);
-    sendLog("📡 Using Weather station on core 0");
+    sendLog("📡 Weather task created");
   } else {  // SOURCE_AHT20
     xTaskCreatePinnedToCore(sensorTask_AHT20, "SensorTask_AHT20", 4096, NULL, 1, &sensorTaskHandle, 0);
-    sendLog("📡 Using AHT20 sensor on core 0");
+    sendLog("📡 AHT20 sensor task created");
   }
+  delayWithYield(100);  // Wait for sensor task to start and initialize
   
-  sendLog("🏗 Dual-core architecture initialized:");
-  sendLog("   Core 1: loop() - Network, WiFi, Web Server, mDNS, NTP");
-  sendLog("   Core 0: Application task - Sensors, Heater Control, Calibration, File I/O");
-  delayWithYield(500);
+  // Background: Heater control task
+  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, NULL, 1, &controlTaskHandle, 0);
+  sendLog("🔥 Heater control task created");
+  
+  delayWithYield(100);  // Let control task start and log
+  sendLog("✅ Architecture initialized - Web GUI in main loop");
+  delayWithYield(50);
 }
 
 // ---------------- Loop ----------------
 void loop() {
-  // Core 1 network operations - no task overhead
+  // Main loop: Web server and network operations (foreground)
   static unsigned long lastWiFiCheck = 0;
   static unsigned long lastNTPCheck = 0;
-  static unsigned long lastRSSIUpdate = 0;
   static unsigned long lastHealthCheck = 0;
   
-  // Handle web requests efficiently
+  unsigned long now = millis();
+  
+  // Handle web requests - highest priority for responsive GUI
   server.handleClient();
   yield();
   
+  // LED status indication
   handleLEDStatus();
-  
-  unsigned long now = millis();
   
   // WiFi reconnect every 10 seconds
   if (now - lastWiFiCheck >= WIFI_RECONNECT_INTERVAL_MS) {
@@ -1692,34 +1676,29 @@ void loop() {
     handleWiFiReconnect();
   }
   
-  // NTP every 2 minutes
+  // NTP sync every 2 minutes
   if (now - lastNTPCheck >= NTP_CHECK_INTERVAL_MS) {
     lastNTPCheck = now;
     handleNTP();
   }
   
-  // Update RSSI every 2 minutes
-  if (now - lastRSSIUpdate >= RSSI_UPDATE_INTERVAL_MS) {
-    lastRSSIUpdate = now;
-    int rssi = WiFi.RSSI();
-    
-    if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1))) {
-      cached_rssi = rssi;
-      xSemaphoreGive(cacheMutex);
-    }
-  }
-  
-  // Monitor task health every 60 seconds
-  if (now - lastHealthCheck > TASK_HEALTH_CHECK_INTERVAL_MS) {
+  // Monitor background task health every 60 seconds
+  if (now - lastHealthCheck > 60000) {
     lastHealthCheck = now;
     
-    // Check if application task is still running
-    if (applicationTaskHandle && eTaskGetState(applicationTaskHandle) == eDeleted) {
-      sendLog("⚠️ Application task died - system restart required");
+    // Check if control task is still running
+    if (controlTaskHandle && eTaskGetState(controlTaskHandle) == eDeleted) {
+      sendLog("⚠️ Control task died - system restart required");
+      ESP.restart();
+    }
+    
+    // Check if sensor task is still running
+    if (sensorTaskHandle && eTaskGetState(sensorTaskHandle) == eDeleted) {
+      sendLog("⚠️ Sensor task died - system restart required");
       ESP.restart();
     }
   }
   
-  // Network loop cycle - balance responsiveness with CPU efficiency
-  delay(NETWORK_LOOP_DELAY_MS);
+  // Fast loop cycle for responsive web interface
+  delay(MAIN_LOOP_DELAY_MS);
 }
