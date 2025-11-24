@@ -20,7 +20,7 @@
 #include <HTTPClient.h>
 #include <math.h>
 
-#define DEVICE_VERSION "v2.7.4"
+#define DEVICE_VERSION "v2.7.5"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
@@ -481,6 +481,19 @@ void logThermalLagInfo() {
 void setupWiFi() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+
+  // Check if we have valid WiFi credentials
+  if (wifiSSID.isEmpty() || wifiPass.isEmpty()) {
+    sendLog("⚠️ No WiFi credentials configured - starting in AP mode");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("DewHeaterSetup");
+    IPAddress apIP = WiFi.softAPIP();
+    sendLog("📡 AP mode started — connect to SSID 'DewHeaterSetup'");
+    sendLog("📶 AP IP address: " + apIP.toString());
+    applyLocalTimezone();
+    setupWebServer();
+    return;
+  }
 
   sendLog("🔌 Connecting to Wi-Fi...");
 
@@ -1051,6 +1064,10 @@ void setupWebServer() {
   });
 
   server.on("/settings", HTTP_POST, []() {
+    bool wifiChanged = false;
+    String oldSSID = wifiSSID;
+    String oldPass = wifiPass;
+    
     if (server.hasArg("delta"))        targetDelta      = server.arg("delta").toFloat();
     if (server.hasArg("dewspread"))    dewSpreadThreshold = server.arg("dewspread").toFloat();
     if (server.hasArg("dewhyst"))      dewSpreadHysteresis = server.arg("dewhyst").toFloat();
@@ -1058,10 +1075,22 @@ void setupWebServer() {
     if (server.hasArg("password"))     wifiPass         = server.arg("password");
     if (server.hasArg("timezoneRule")) timezoneRule     = server.arg("timezoneRule");
 
+    // Check if WiFi credentials changed
+    if (oldSSID != wifiSSID || oldPass != wifiPass) {
+      wifiChanged = true;
+    }
+
     sendLog("⚙️ Settings updated");
     saveConfig();
     server.sendHeader("Location", "/");
     server.send(303);
+    
+    // Restart only if WiFi credentials changed
+    if (wifiChanged) {
+      sendLog("📡 WiFi credentials changed - restarting...");
+      delay(500);  // Let response finish sending
+      ESP.restart();  // Clean restart to apply new WiFi settings
+    }
   });
 
   server.on("/pwmtest", HTTP_POST, []() {
