@@ -1,6 +1,8 @@
 // DewHeaterController — Dew Spread Control
 // Replaces RH threshold gating with dew-point spread gating (Ta - Td)
 // Default dew spread threshold = 3.0 °C, hysteresis = 1.0 °C
+// Board XAIO ESP32S3 with ATH40 sensor
+
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -20,10 +22,11 @@
 #include <HTTPClient.h>
 #include <math.h>
 
-#define DEVICE_VERSION "v2.7.5"
+//#define DEBUG_MODE 1
+
+#define DEVICE_VERSION "v2.8.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
-#define DEBUG_MODE 0
 #define CONFIG_FILE "/config.json"
 #define CALIBRATION_FILE "/calibration.csv"
 #define LOOP_INTERVAL_MS 1000
@@ -67,7 +70,6 @@
 
 #define DEFAULT_TEMPDELTA     4.0
 
-//#define DEBUG_MODE 1
 #if DEBUG_MODE
   #define DEBUG_PRINT(x) Serial.println(x)
 #else
@@ -80,7 +82,7 @@ enum SensorSource {
   SOURCE_SHT40,
   SOURCE_WEATHER
 };
-SensorSource sensorSource = SOURCE_SHT40;  // default
+SensorSource sensorSource = SOURCE_AHT20;  // AHT20 confirmed
 
 SemaphoreHandle_t   i2cMutex;
 SemaphoreHandle_t   cacheMutex;
@@ -1189,10 +1191,27 @@ void sensorTask_AHT20(void* parameter) {
   sendLog("🧪 SDA = " + String(I2C_SDA) + ", SCL = " + String(I2C_SCL));
 
   I2CBus.begin(I2C_SDA, I2C_SCL);
-  delay(10);
+  delay(30);  // Increased delay for sensor stabilization
 
   if (!aht.begin(&I2CBus)) {
-    sendLog("❌ AHT20 init failed");
+    sendLog("❌ AHT20 init failed - running I2C bus scan...");
+    
+    // Scan I2C bus to see what's present
+    bool foundAny = false;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      I2CBus.beginTransmission(addr);
+      if (I2CBus.endTransmission() == 0) {
+        sendLog("🔍 I2C device found at 0x" + String(addr, HEX));
+        foundAny = true;
+      }
+    }
+    
+    if (!foundAny) {
+      sendLog("❌ No I2C devices found on bus - check wiring/power");
+    } else {
+      sendLog("⚠️ I2C bus active but AHT20 not responding at 0x38");
+    }
+    
     vTaskDelete(NULL);
     return;
   }
@@ -1227,10 +1246,27 @@ void sensorTask_SHT40(void* parameter) {
   sendLog("🧪 SDA = " + String(I2C_SDA) + ", SCL = " + String(I2C_SCL));
 
   I2CBus.begin(I2C_SDA, I2C_SCL);
-  delay(10);
+  delay(30);  // Increased delay for sensor stabilization
 
   if (!sht4.begin(&I2CBus)) {
-    sendLog("❌ SHT40 init failed");
+    sendLog("❌ SHT40 init failed - running I2C bus scan...");
+    
+    // Scan I2C bus to see what's present
+    bool foundAny = false;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      I2CBus.beginTransmission(addr);
+      if (I2CBus.endTransmission() == 0) {
+        sendLog("🔍 I2C device found at 0x" + String(addr, HEX));
+        foundAny = true;
+      }
+    }
+    
+    if (!foundAny) {
+      sendLog("❌ No I2C devices found on bus - check wiring/power");
+    } else {
+      sendLog("⚠️ I2C bus active but SHT40 not responding at 0x44");
+    }
+    
     vTaskDelete(NULL);
     return;
   }
