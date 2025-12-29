@@ -24,7 +24,7 @@
 
 //#define DEBUG_MODE 1
 
-#define DEVICE_VERSION "v2.8.0"
+#define DEVICE_VERSION "v2.9.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
@@ -82,7 +82,7 @@ enum SensorSource {
   SOURCE_SHT40,
   SOURCE_WEATHER
 };
-SensorSource sensorSource = SOURCE_AHT20;  // AHT20 confirmed
+SensorSource sensorSource = SOURCE_SHT40;  // Try external SHT40 first, fallback to weather  
 
 SemaphoreHandle_t   i2cMutex;
 SemaphoreHandle_t   cacheMutex;
@@ -294,7 +294,7 @@ bool fetchOutdoorWeather(float* outTemp, float* outHumidity) {
     float temp = metric["temp"] | NAN;
     float hum  = obsRoot["humidity"] | NAN;  // fixed
 
-    sendLog("📡 Extracted temp=" + String(temp) + ", humidity=" + String(hum));
+    // Data extracted - values displayed in main window
 
     if (!isnan(temp) && !isnan(hum)) {
       *outTemp = temp;
@@ -1176,7 +1176,7 @@ void weatherTask(void* parameter) {
           humidity = outHumidity;
           xSemaphoreGive(i2cMutex);
         }
-        sendLog("🌤 Weather updated: " + String(outTemp,1) + "°C, " + String(outHumidity,1) + "%");
+        // Weather data updated - displayed in main window
       } else {
         sendLog("⚠️ Weather fetch failed.");
       }
@@ -1266,6 +1266,12 @@ void sensorTask_SHT40(void* parameter) {
     } else {
       sendLog("⚠️ I2C bus active but SHT40 not responding at 0x44");
     }
+    
+    // Fallback to weather station
+    sendLog("🔄 Falling back to weather station for temperature/humidity data");
+    sensorSource = SOURCE_WEATHER;
+    xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 0);
+    sendLog("📡 Weather task created as fallback");
     
     vTaskDelete(NULL);
     return;
