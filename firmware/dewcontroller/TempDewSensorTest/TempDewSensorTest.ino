@@ -15,6 +15,7 @@
 
 #define DEVICE_VERSION "v2.5.0"
 #define DEVICE_NAME "DewHeaterController"
+#define DEFAULT_WIFI_SSID "AstroNetC925"
 #define SIMULATE_HARDWARE 0
 #define DEBUG_MODE 0
 #define CONFIG_FILE "/config.json"
@@ -76,7 +77,7 @@ float glassCoeffA = GLASSCOEFFA;
 float glassCoeffB = GLASSCOEFFB;
 float glassCoeffC = GLASSCOEFFC;
 
-String  wifiSSID = "MicroConcepts-2G";
+String  wifiSSID = DEFAULT_WIFI_SSID;
 String  wifiPass = "";
 float   timezoneOffsetHours = 10.0;
 bool    heaterEnabled = false, calibrating = false;
@@ -229,7 +230,7 @@ void loadConfig() {
   // glassCoeffB = doc["glassCoeffB"] | GLASSCOEFFB;
   // glassCoeffC = doc["glassCoeffC"] | GLASSCOEFFC;
   heaterEnabled       = doc["heater"]      | false;
-  wifiSSID            = doc["ssid"]        | "MicroConcepts-2G";
+  wifiSSID            = doc["ssid"]        | DEFAULT_WIFI_SSID;
   wifiPass            = doc["password"]    | "leanneannatinka";
   timezoneOffsetHours = doc["timezone"]    | 10.0;
 

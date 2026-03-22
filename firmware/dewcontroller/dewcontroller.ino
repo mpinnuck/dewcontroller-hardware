@@ -24,7 +24,7 @@
 
 //#define DEBUG_MODE 1
 
-#define DEVICE_VERSION "v2.9.0"
+#define DEVICE_VERSION "v3.0.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
@@ -70,6 +70,8 @@
 
 #define DEFAULT_TEMPDELTA     4.0
 
+#define DEFAULT_WIFI_SSID     "AstroNetC925"
+
 #if DEBUG_MODE
   #define DEBUG_PRINT(x) Serial.println(x)
 #else
@@ -110,7 +112,7 @@ float glassCoeffA = GLASSCOEFFA;
 float glassCoeffB = GLASSCOEFFB;
 float glassCoeffC = GLASSCOEFFC;
 
-String  wifiSSID = "";
+String  wifiSSID = DEFAULT_WIFI_SSID;
 String  wifiPass = "";
 // Timezone rule for TZ environment (AEST/AEDT for Sydney by default)
 String  timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
@@ -128,6 +130,9 @@ const int MAX_LOG_SIZE = 65536;  // 64KB log buffer - keep more startup history
 String  logBuffer;
 
 bool ntpInitialized = false;
+bool apFallbackActive = false;           // true when AP mode started due to STA failure
+unsigned long apFallbackTime = 0;        // millis() when AP fallback began
+const unsigned long AP_FALLBACK_COOLDOWN_MS = 300000;  // 5 minutes before retrying STA
 
 // Background task cache variables
 float cached_td = NAN;
@@ -497,7 +502,7 @@ void setupWiFi() {
     return;
   }
 
-  sendLog("🔌 Connecting to Wi-Fi...");
+  sendLog("🔌 Connecting to Wi-Fi SSID: " + wifiSSID + "...");
 
   // --- Step 1: Clean disconnect and setup STA mode ---
   WiFi.disconnect(true, true);
@@ -626,9 +631,26 @@ void setupWiFi() {
 
   // --- Step 6: Fallback to AP mode ---
   sendLog("❌ Wi-Fi connection failed after extended wait. Switching to Access Point mode...");
-  WiFi.mode(WIFI_AP);
+  apFallbackActive = true;
+  apFallbackTime = millis();
+
+  // Clean teardown of STA before starting AP — prevents radio state issues
+  WiFi.disconnect(true, true);  // disconnect + erase STA credentials from RAM
+  delay(200);
+  WiFi.mode(WIFI_OFF);          // fully power down WiFi radio
+  delay(500);                    // let radio settle
+  WiFi.mode(WIFI_AP);           // start fresh in AP mode
+  delay(200);
   WiFi.softAP("DewHeaterSetup");
+  delay(500);                    // let AP stabilize before checking IP
+
   IPAddress apIP = WiFi.softAPIP();
+  if (apIP == IPAddress(0, 0, 0, 0)) {
+    sendLog("⚠️ AP IP is 0.0.0.0 — retrying softAP...");
+    WiFi.softAP("DewHeaterSetup");
+    delay(1000);
+    apIP = WiFi.softAPIP();
+  }
   sendLog("📡 AP mode started — connect to SSID 'DewHeaterSetup'");
   sendLog("📶 AP IP address: " + apIP.toString());
   applyLocalTimezone(); // keep timestamps correct in AP mode
@@ -1392,6 +1414,14 @@ void handleWiFiReconnect() {
   bool haveCreds = !wifiSSID.isEmpty();   // we know user wants STA if SSID configured
   if (!haveCreds) return;
 
+  // Don't retry STA during AP fallback cooldown — let AP mode run undisturbed
+  if (apFallbackActive) {
+    if (millis() - apFallbackTime < AP_FALLBACK_COOLDOWN_MS) return;
+    // Cooldown expired — allow STA retry
+    sendLog("🔁 AP fallback cooldown expired — retrying STA connection...");
+    apFallbackActive = false;
+  }
+
   // ---- Case 1: STA is connected ----
   if (status == WL_CONNECTED) {
     if (wasDisconnected) {
@@ -1400,6 +1430,7 @@ void handleWiFiReconnect() {
 
       sendLog("✅ Wi-Fi reconnected: " + WiFi.localIP().toString());
       logWiFiStatus("WiFi");
+      apFallbackActive = false;  // Clear fallback flag on successful connection
 
       delay(500); // give stack time to stabilise
 
