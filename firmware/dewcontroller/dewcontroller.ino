@@ -16,18 +16,22 @@
 #include "esp_sntp.h"
 #include <WebServer.h>
 #include <ArduinoJson.h>
-#include <ESPmDNS.h>
 #include "esp_log.h"
 #include <time.h>
 #include <HTTPClient.h>
 #include <math.h>
 
-//#define DEBUG_MODE 1
+#ifndef DEBUG_MODE
+#define DEBUG_MODE 0
+#endif
 
-#define DEVICE_VERSION "v3.0.0"
+#define DEVICE_VERSION "v4.0.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
+
+// Weather API key — rotate if this firmware is ever shared publicly
+#define WEATHER_API_KEY "5356e369de454c6f96e369de450c6f22"
 #define CALIBRATION_FILE "/calibration.csv"
 #define LOOP_INTERVAL_MS 1000
 #define WEATHER_POLL_INTERVAL_MS 5 * 60 * 1000 // 300000 ms or 5 minutes
@@ -37,12 +41,11 @@
 #define WIFI_RECONNECT_INTERVAL_MS 10000  // 10 seconds
 #define NTP_CHECK_INTERVAL_MS 120000      // 2 minutes
 #define RSSI_UPDATE_INTERVAL_MS 120000    // 2 minutes
-#define FILE_CACHE_UPDATE_INTERVAL_MS 600000  // 10 minutes
 #define MAIN_LOOP_DELAY_MS 25             // Main loop cycle time
 
 // Control task timing constants (Background - runs in task)
 #define APP_UPDATE_INTERVAL_MS 1000       // 1 second - heater control loop
-#define CALIBRATION_UPDATE_INTERVAL_MS 10000  // 10 seconds
+#define CALIBRATION_UPDATE_INTERVAL_MS 30000  // 30 seconds - matches CAL_SAMPLE_INTERVAL_MS
 #define THERMAL_LOG_INTERVAL_MS 600000    // 10 minutes
 #define CONTROL_TASK_DELAY_MS 50          // Background control task cycle
 
@@ -60,9 +63,7 @@
 #define GLASSCOEFFC  -19.20
 #define GLASSCOEFFDP  2  // number of decimal places
 
-// Tracks recent history for dT/dt estimation
-#define TA_HISTORY_SIZE 10
-#define TA_SAMPLE_INTERVAL_SEC 5
+
 
 // Heater defaults
 #define DEFAULT_DEWSPREAD     3.0
@@ -96,8 +97,7 @@ TwoWire             I2CBus = TwoWire(1);  // Dedicated I2C bus
 Adafruit_AHTX0      aht;
 Adafruit_SHT4x      sht4;
 
-float TaHistory[TA_HISTORY_SIZE];
-unsigned long lastTaSampleTime = 0;
+bool webServerInitialized = false;  // guard against repeated route registration
 
 // -------------- Status and config variables --------------
 float ambientTemp = 0, humidity = 0, glassTemp = 0;
@@ -119,12 +119,10 @@ String  timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 bool    heaterEnabled = false, calibrating = false;
 
 // -------------- Calibration variables --------------
-float   lastSampledTemp = -100.0;
 int     calCount = 0, pwm = 0;
 bool    pwmTest = false;
+volatile bool calResetRequested = false;  // flag for /calibrate handler to reset statics in updateCalibration()
 const unsigned long CAL_SAMPLE_INTERVAL_MS = 30000;  // 30 seconds
-unsigned long lastCalSampleTime = 0;
-bool    firstCalSample = true;  // header line
 
 const int MAX_LOG_SIZE = 65536;  // 64KB log buffer - keep more startup history
 String  logBuffer;
@@ -149,21 +147,6 @@ void handleNTP(bool forceCheck = false);
 
 
 // -------------- Utility --------------
-
-// Smart delay that yields periodically without constant overhead
-void delayWithYield(unsigned long ms) {
-  unsigned long chunks = ms / 100;
-  unsigned long remainder = ms % 100;
-  
-  for (unsigned long i = 0; i < chunks; i++) {
-    delay(100);
-    yield();
-  }
-  
-  if (remainder > 0) {
-    delay(remainder);
-  }
-}
 
 // Utility: decode Wi-Fi status to readable string
 String wifiStatusToString(wl_status_t status) {
@@ -230,7 +213,28 @@ String getCalibrationFileSizeKB(const char* filename) {
 }
 
 // Weather API (change as required)
-const char* WEATHER_API_URL = "https://api.weather.com/v2/pws/observations/current?stationId=ISYDNEY478&format=json&units=m&apiKey=5356e369de454c6f96e369de450c6f22";
+const char* WEATHER_API_URL = "https://api.weather.com/v2/pws/observations/current?stationId=ISYDNEY478&format=json&units=m&apiKey=" WEATHER_API_KEY;
+
+// Write ambient temp and humidity under mutex for cross-core safety
+void writeSensorValues(float newTemp, float newHumidity) {
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+    ambientTemp = newTemp;
+    humidity = newHumidity;
+    xSemaphoreGive(i2cMutex);
+  }
+}
+
+// Read ambient temp and humidity under mutex for cross-core safety
+void readSensorValues(float &outTemp, float &outHumidity) {
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+    outTemp = ambientTemp;
+    outHumidity = humidity;
+    xSemaphoreGive(i2cMutex);
+  } else {
+    outTemp = ambientTemp;
+    outHumidity = humidity;
+  }
+}
 
 // Magnus formula for dew point (Celsius)
 float dewPointC(float T, float RH) {
@@ -420,30 +424,9 @@ float readGlassTemp() {
   return (glassCoeffA * V * V) + (glassCoeffB * V) + glassCoeffC;
 }
 
-// Update ambient temperature history
-void updateTaHistory(float newTa) {
-  for (int i = 1; i < TA_HISTORY_SIZE; i++) {
-    TaHistory[i - 1] = TaHistory[i];
-  }
-  TaHistory[TA_HISTORY_SIZE - 1] = newTa;
-}
-
 // Called every LOOP_INTERVAL_MS
 void updateGlassTemp() {
-  float t, h;
-  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-    t = ambientTemp;
-    h = humidity;
-    xSemaphoreGive(i2cMutex);
-  }
-
   glassTemp = readGlassTemp();
-
-  // Update ambient history every few seconds
-  if (millis() - lastTaSampleTime > TA_SAMPLE_INTERVAL_SEC * 1000UL) {
-    updateTaHistory(t);
-    lastTaSampleTime = millis();
-  }
 }
 
 // Log thermal lag periodically - now called less frequently from main loop
@@ -451,7 +434,8 @@ void logThermalLagInfo() {
   static float prevTa = 0.0;
   static unsigned long prevTime = 0;
 
-  float Ta = ambientTemp;
+  float Ta, h;
+  readSensorValues(Ta, h);
   float Tg = glassTemp;
 
   unsigned long now = millis();
@@ -473,7 +457,7 @@ void logThermalLagInfo() {
           "°C, dTa/dt = " + String(gradientPerHour, 2) + " °C/hour");
 
   // Extra dew metrics
-  float td = dewPointC(Ta, humidity);
+  float td = dewPointC(Ta, h);
   if (!isnan(td)) {
     float spread = Ta - td;
     sendLog(String("💧 Td = ") + String(td, 2) + "°C, "
@@ -687,6 +671,14 @@ void setupNTP() {
 }
 
 void setupWebServer() {
+  // Guard against repeated route registration on WiFi reconnect
+  if (webServerInitialized) {
+    server.begin();
+    sendLog("🌐 Web server restarted (routes already registered)");
+    return;
+  }
+  webServerInitialized = true;
+
   server.on("/", []() {
     String html = R"rawliteral(
       <html><head><meta charset="utf-8"><title>Dew Heater</title>
@@ -924,7 +916,7 @@ void setupWebServer() {
             </div>
             <div class="inputrow">
               <label>Password:</label>
-              <input name="password" type="password" value=")rawliteral" + wifiPass + R"rawliteral(">
+              <input name="password" type="password" placeholder="(unchanged)">
             </div>
             <div class="inputrow">
               <label>Timezone Rule:</label>
@@ -932,11 +924,10 @@ void setupWebServer() {
             </div>
             <button type="submit">Update Settings</button>
           </form>
-            <p> T_glass = T_ambient + )rawliteral" 
+            <p> T_glass = )rawliteral" 
               + String(glassCoeffA, 1) + R"rawliteral(·V² + )rawliteral"
               + String(glassCoeffB, 1) + R"rawliteral(·V + )rawliteral"
               + String(glassCoeffC, 1) + R"rawliteral(</p>
-            </p>
         </div>
       </div>
 
@@ -994,14 +985,7 @@ void setupWebServer() {
 
     // Fast path - just get current values
     float t, h;
-    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(2))) {
-      t = ambientTemp;
-      h = humidity;
-      xSemaphoreGive(i2cMutex);
-    } else {
-      t = ambientTemp;
-      h = humidity;
-    }
+    readSensorValues(t, h);
 
     float delta = glassTemp - cached_td_local;  // Tg - Td (glass temp above dew point)
     int pwmPercent = pwm * 100 / 255;
@@ -1077,10 +1061,8 @@ void setupWebServer() {
 
   server.on("/calibrate", HTTP_POST, []() {
     calibrating = !calibrating;
-    lastSampledTemp = -100.0;
-    lastCalSampleTime = 0;
     calCount = 0;
-    firstCalSample = true;
+    calResetRequested = true;  // signal updateCalibration() to reset its statics
 
     if (calibrating) sendLog("🧪 Calibration STARTED — sampling every 30 sec: [time, ambient, V, PWM %]");
     else sendLog("✅ Calibration STOPPED");
@@ -1096,7 +1078,10 @@ void setupWebServer() {
     if (server.hasArg("dewspread"))    dewSpreadThreshold = server.arg("dewspread").toFloat();
     if (server.hasArg("dewhyst"))      dewSpreadHysteresis = server.arg("dewhyst").toFloat();
     if (server.hasArg("ssid"))         wifiSSID         = server.arg("ssid");
-    if (server.hasArg("password"))     wifiPass         = server.arg("password");
+    // Only update password if user actually typed a new one
+    if (server.hasArg("password") && server.arg("password").length() > 0) {
+      wifiPass = server.arg("password");
+    }
     if (server.hasArg("timezoneRule")) timezoneRule     = server.arg("timezoneRule");
 
     // Check if WiFi credentials changed
@@ -1193,12 +1178,7 @@ void weatherTask(void* parameter) {
     if (sensorSource == SOURCE_WEATHER) {
       bool ok = fetchOutdoorWeather(&outTemp, &outHumidity);
       if (ok) {
-        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-          ambientTemp = outTemp;
-          humidity = outHumidity;
-          xSemaphoreGive(i2cMutex);
-        }
-        // Weather data updated - displayed in main window
+        writeSensorValues(outTemp, outHumidity);
       } else {
         sendLog("⚠️ Weather fetch failed.");
       }
@@ -1245,11 +1225,7 @@ void sensorTask_AHT20(void* parameter) {
     aht.getEvent(&h, &t);
 
     if (!isnan(t.temperature) && !isnan(h.relative_humidity)) {
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-        ambientTemp = t.temperature;
-        humidity = h.relative_humidity;
-        xSemaphoreGive(i2cMutex);
-      }
+      writeSensorValues(t.temperature, h.relative_humidity);
     } else {
       sendLog("⚠️ AHT20 returned bad data, trying soft reset...");
       I2CBus.beginTransmission(0x38);
@@ -1309,11 +1285,7 @@ void sensorTask_SHT40(void* parameter) {
     sht4.getEvent(&humidity_event, &temp_event);
 
     if (!isnan(temp_event.temperature) && !isnan(humidity_event.relative_humidity)) {
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5))) {
-        ambientTemp = temp_event.temperature;
-        humidity = humidity_event.relative_humidity;
-        xSemaphoreGive(i2cMutex);
-      }
+      writeSensorValues(temp_event.temperature, humidity_event.relative_humidity);
     } else {
       sendLog("⚠️ SHT40 returned bad data");
     }
@@ -1352,10 +1324,17 @@ void controlTask(void* parameter) {
       updateHeaterControl();
     }
     
-    // Calibration every 10 seconds
+    // Calibration (interval matches CAL_SAMPLE_INTERVAL_MS)
     if (now - lastCalibrationUpdate >= CALIBRATION_UPDATE_INTERVAL_MS) {
       lastCalibrationUpdate = now;
       updateCalibration();
+    }
+    
+    // Thermal lag logging every 10 minutes
+    static unsigned long lastThermalLog = 0;
+    if (now - lastThermalLog >= THERMAL_LOG_INTERVAL_MS) {
+      lastThermalLog = now;
+      logThermalLagInfo();
     }
     
     // Update cache every 2 minutes
@@ -1364,14 +1343,7 @@ void controlTask(void* parameter) {
       
       // Update dew point calculations
       float t, h;
-      if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(1))) {
-        t = ambientTemp;
-        h = humidity;
-        xSemaphoreGive(i2cMutex);
-      } else {
-        t = ambientTemp;
-        h = humidity;
-      }
+      readSensorValues(t, h);
       
       float td = dewPointC(t, h);
       float spread = isnan(td) ? NAN : (t - td);
@@ -1545,35 +1517,36 @@ void handleLEDStatus() {
   }
 }
 
+#if SIMULATE_HARDWARE
 void simulateHardware() {
   ambientTemp = 17.0 + sin(millis() / 12000.0);
   humidity = 78.0 + sin(millis() / 8000.0);
 }
+#endif
 
 void updateHeaterControl() {
   // Persistent integral for PI
   static float pwmIntegral = 0.0;
+  static bool dewGateLatched = false; // on/off hysteresis latch
 
   if (pwmTest) return;                 // manual test overrides
   if (!heaterEnabled || isnan(glassTemp)) {
+    // NOTE: integral resets on disable — on re-enable, output starts from
+    // Kp*error only (no integral history). This is intentional to avoid
+    // stale integral terms after extended off periods.
     pwm = 0;
     pwmIntegral = 0.0;
+    dewGateLatched = false;
     analogWrite(PWM_PIN, pwm);
     return;
   }
 
-  float t;
-  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-    t = ambientTemp;
-    xSemaphoreGive(i2cMutex);
-  } else {
-    t = ambientTemp;
-  }
+  float t, h;
+  readSensorValues(t, h);
 
   // ---- Calculate dew point and control target ----
-  float td = dewPointC(t, humidity);
+  float td = dewPointC(t, h);
   bool dewGate = false;
-  static bool dewGateLatched = false; // on/off hysteresis latch
 
   if (isnan(td)) {
     // If dew point cannot be computed, fail-safe OFF
@@ -1583,7 +1556,7 @@ void updateHeaterControl() {
     return;
   }
 
-  float spread = t - td;  // smaller spread => higher condensation risk
+  float spread = t - td;  // smaller spread => higher condensation risk (uses mutex-protected h)
   
   // Gate by dew spread with hysteresis
   // ON when spread <= threshold; OFF when spread > threshold + hysteresis
@@ -1600,29 +1573,26 @@ void updateHeaterControl() {
     float error = targetGlassTemp - glassTemp;
 
     // PI control constants
-    const float Kp = 50.0f;   // tune as needed
+    const float Kp = 20.0f;   // tune as needed
     const float Ki = 0.02f;
-    const int   PWM_MIN = 64;
+    const int   PWM_MIN = 64;   // ~25% keep-alive floor while dew gate is active
     const int   PWM_MAX = 255;
     const float integralMax = 500.0f;
 
-    // Update integral term
-    pwmIntegral += error;
-
-    // Anti-windup clamp
-    if (pwmIntegral > integralMax) pwmIntegral = integralMax;
-    else if (pwmIntegral < -integralMax) pwmIntegral = -integralMax;
-
-    // Compute PI output
+    // Only integrate when not saturated — prevents windup
     float pwmValueF = Kp * error + Ki * pwmIntegral;
-
-    // Clamp to allowed range
-    int pwmValue = constrain(int(pwmValueF), PWM_MIN, PWM_MAX);
-
-    // If glass already at target, maintain minimum hold for stability
-    if (glassTemp >= targetGlassTemp && pwmValue < PWM_MIN) {
-      pwmValue = PWM_MIN;
+    if (pwmValueF >= PWM_MIN && pwmValueF <= PWM_MAX) {
+      pwmIntegral += error;
+      if (pwmIntegral > integralMax) pwmIntegral = integralMax;
+      if (pwmIntegral < -integralMax) pwmIntegral = -integralMax;
     }
+
+    // Single output computation using (possibly updated) integral
+    pwmValueF = Kp * error + Ki * pwmIntegral;
+    int pwmValue = constrain(int(pwmValueF), 0, PWM_MAX);
+
+    // Enforce minimum keep-alive power while dew gate is active
+    if (pwmValue < PWM_MIN) pwmValue = PWM_MIN;
 
     pwm = pwmValue;
   } else {
@@ -1638,11 +1608,19 @@ void updateCalibration() {
   static unsigned long lastCalSampleTime = 0;
   static bool firstCalSample = true;
 
+  // Reset statics when requested by /calibrate handler
+  if (calResetRequested) {
+    lastCalSampleTime = 0;
+    firstCalSample = true;
+    calResetRequested = false;
+  }
+
   if (!calibrating) return;
   if (millis() - lastCalSampleTime < CAL_SAMPLE_INTERVAL_MS) return;
   lastCalSampleTime = millis();
 
-  float Ta = ambientTemp;
+  float Ta, hUnused;
+  readSensorValues(Ta, hUnused);
   float V = readThermistorVoltage();
   int pwmPercent = pwm * 100 / 255;
 
@@ -1706,17 +1684,17 @@ void handleNTP(bool forceCheck) {
 
 // ---------------- Setup ----------------
 void setup() {
+  // Create mutexes ABSOLUTELY FIRST — before any code that could call sendLog()
+  i2cMutex = xSemaphoreCreateMutex();
+  cacheMutex = xSemaphoreCreateMutex();
+  logMutex = xSemaphoreCreateMutex();
+
   logBuffer = "";
 #if DEBUG_MODE 
   Serial.begin(115200);
   delay(1200);
   DEBUG_PRINT("🔍 Serial started at 115200 baud");
 #endif
-
-  // Create mutexes FIRST - before any logging or multi-threaded operations
-  i2cMutex = xSemaphoreCreateMutex();
-  cacheMutex = xSemaphoreCreateMutex();
-  logMutex = xSemaphoreCreateMutex();
 
   sendLog("🚀 Sketch started");
 
@@ -1732,28 +1710,28 @@ void setup() {
   sendLog("🏗 Initializing architecture...");
   sendLog("   Main loop: Web Server, WiFi, mDNS, NTP (foreground)");
   sendLog("   Background tasks: Sensors, Heater Control, Calibration");
-  delayWithYield(100);
+  delay(100);
   
   // Background: Sensor tasks
   if (sensorSource == SOURCE_SHT40) {
-    xTaskCreatePinnedToCore(sensorTask_SHT40, "SensorTask_SHT40", 4096, NULL, 1, &sensorTaskHandle, 0);
+    xTaskCreatePinnedToCore(sensorTask_SHT40, "SensorTask_SHT40", 8192, NULL, 1, &sensorTaskHandle, 0);
     sendLog("📡 SHT40 sensor task created");
   } else if (sensorSource == SOURCE_WEATHER) {
     xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 0);
     sendLog("📡 Weather task created");
   } else {  // SOURCE_AHT20
-    xTaskCreatePinnedToCore(sensorTask_AHT20, "SensorTask_AHT20", 4096, NULL, 1, &sensorTaskHandle, 0);
+    xTaskCreatePinnedToCore(sensorTask_AHT20, "SensorTask_AHT20", 8192, NULL, 1, &sensorTaskHandle, 0);
     sendLog("📡 AHT20 sensor task created");
   }
-  delayWithYield(100);  // Wait for sensor task to start and initialize
+  delay(100);  // Wait for sensor task to start and initialize
   
   // Background: Heater control task
-  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, NULL, 1, &controlTaskHandle, 0);
+  xTaskCreatePinnedToCore(controlTask, "ControlTask", 8192, NULL, 1, &controlTaskHandle, 0);
   sendLog("🔥 Heater control task created");
   
-  delayWithYield(100);  // Let control task start and log
+  delay(100);  // Let control task start and log
   sendLog("✅ Architecture initialized - Web GUI in main loop");
-  delayWithYield(50);
+  delay(50);
 }
 
 // ---------------- Loop ----------------
