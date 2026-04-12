@@ -25,7 +25,7 @@
 #define DEBUG_MODE 0
 #endif
 
-#define DEVICE_VERSION "v4.0.0"
+#define DEVICE_VERSION "v4.1.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
@@ -42,6 +42,7 @@
 #define NTP_CHECK_INTERVAL_MS 120000      // 2 minutes
 #define RSSI_UPDATE_INTERVAL_MS 120000    // 2 minutes
 #define MAIN_LOOP_DELAY_MS 25             // Main loop cycle time
+#define AP_STA_SCAN_INTERVAL_MS 30000     // 30 seconds — scan for STA SSID while in AP fallback
 
 // Control task timing constants (Background - runs in task)
 #define APP_UPDATE_INTERVAL_MS 1000       // 1 second - heater control loop
@@ -1386,12 +1387,61 @@ void handleWiFiReconnect() {
   bool haveCreds = !wifiSSID.isEmpty();   // we know user wants STA if SSID configured
   if (!haveCreds) return;
 
-  // Don't retry STA during AP fallback cooldown — let AP mode run undisturbed
+  // While in AP fallback, periodically scan for the target SSID and connect when found
   if (apFallbackActive) {
-    if (millis() - apFallbackTime < AP_FALLBACK_COOLDOWN_MS) return;
-    // Cooldown expired — allow STA retry
-    sendLog("🔁 AP fallback cooldown expired — retrying STA connection...");
-    apFallbackActive = false;
+    static unsigned long lastScanTime = 0;
+    static bool scanInProgress = false;
+    unsigned long nowMs = millis();
+
+    // Start a new async scan every AP_STA_SCAN_INTERVAL_MS
+    if (!scanInProgress && (nowMs - lastScanTime >= AP_STA_SCAN_INTERVAL_MS)) {
+      sendLog("🔍 AP mode: scanning for SSID '" + wifiSSID + "'...");
+      if (WiFi.getMode() == WIFI_AP) {
+        WiFi.mode(WIFI_AP_STA);  // STA interface required to initiate a scan
+      }
+      WiFi.scanNetworks(true);  // async, non-blocking
+      scanInProgress = true;
+      lastScanTime = nowMs;
+      return;
+    }
+
+    if (scanInProgress) {
+      int n = WiFi.scanComplete();
+      if (n == WIFI_SCAN_RUNNING) return;  // still scanning
+
+      scanInProgress = false;
+      bool found = false;
+
+      if (n >= 0) {
+        for (int i = 0; i < n; i++) {
+          if (WiFi.SSID(i) == wifiSSID) {
+            found = true;
+            sendLog("📶 SSID '" + wifiSSID + "' visible (RSSI " + String(WiFi.RSSI(i)) + " dBm) — attempting STA connection...");
+            break;
+          }
+        }
+        WiFi.scanDelete();
+      } else {
+        sendLog("⚠️ WiFi scan error (" + String(n) + ") — staying in AP mode");
+        if (WiFi.getMode() == WIFI_AP_STA) WiFi.mode(WIFI_AP);  // revert to pure AP
+        return;
+      }
+
+      if (found) {
+        WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+        apFallbackActive = false;  // let reconnect logic manage the connection attempt
+        wasDisconnected = true;    // trigger post-connect recovery when STA succeeds
+        offlineSince = nowMs;
+        lastReconnectAttempt = nowMs;
+        return;
+      } else {
+        sendLog("📡 SSID not found — staying in AP mode (next scan in " + String(AP_STA_SCAN_INTERVAL_MS / 1000) + "s)");
+        if (WiFi.getMode() == WIFI_AP_STA) WiFi.mode(WIFI_AP);  // revert to pure AP
+        return;
+      }
+    }
+
+    return;  // AP fallback active, no scan due yet
   }
 
   // ---- Case 1: STA is connected ----
@@ -1403,6 +1453,13 @@ void handleWiFiReconnect() {
       sendLog("✅ Wi-Fi reconnected: " + WiFi.localIP().toString());
       logWiFiStatus("WiFi");
       apFallbackActive = false;  // Clear fallback flag on successful connection
+
+      // If we connected while in AP_STA mode (scanned and found SSID), drop the AP
+      if (WiFi.getMode() == WIFI_AP_STA) {
+        sendLog("📡 Switching from AP_STA to STA — AP no longer needed");
+        WiFi.mode(WIFI_STA);
+        delay(200);
+      }
 
       delay(500); // give stack time to stabilise
 
