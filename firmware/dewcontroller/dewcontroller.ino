@@ -25,7 +25,7 @@
 #define DEBUG_MODE 0
 #endif
 
-#define DEVICE_VERSION "v4.1.0"
+#define DEVICE_VERSION "v4.2.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
@@ -33,6 +33,9 @@
 // Weather API key — rotate if this firmware is ever shared publicly
 #define WEATHER_API_KEY "5356e369de454c6f96e369de450c6f22"
 #define CALIBRATION_FILE "/calibration.csv"
+#define LOG_FILE "/thermal.log"
+#define LOG_PRUNE_SIZE 16384       // 16KB — date-based prune threshold
+#define MAX_THERMAL_LOG_SIZE 32768 // 32KB — hard cap, truncates oldest half
 #define LOOP_INTERVAL_MS 1000
 #define WEATHER_POLL_INTERVAL_MS 5 * 60 * 1000 // 300000 ms or 5 minutes
 #define WIFI_STATUS_CHECK_INTERVAL_MS 5000 // 5 seconds - faster disconnect detection
@@ -129,6 +132,7 @@ const int MAX_LOG_SIZE = 65536;  // 64KB log buffer - keep more startup history
 String  logBuffer;
 
 bool ntpInitialized = false;
+bool logPruned = false;                  // true after first NTP-triggered thermal log prune
 bool apFallbackActive = false;           // true when AP mode started due to STA failure
 unsigned long apFallbackTime = 0;        // millis() when AP fallback began
 const unsigned long AP_FALLBACK_COOLDOWN_MS = 300000;  // 5 minutes before retrying STA
@@ -145,6 +149,7 @@ unsigned long lastCacheUpdate = 0;
 void setupNTP();
 void setupWebServer();
 void handleNTP(bool forceCheck = false);
+void pruneThermalLog(const struct tm& timeinfo);
 
 
 // -------------- Utility --------------
@@ -432,6 +437,12 @@ void updateGlassTemp() {
 
 // Log thermal lag periodically - now called less frequently from main loop
 void logThermalLagInfo() {
+  char timeStr[32] = "??";
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  }
+
   static float prevTa = 0.0;
   static unsigned long prevTime = 0;
 
@@ -464,6 +475,17 @@ void logThermalLagInfo() {
     sendLog(String("💧 Td = ") + String(td, 2) + "°C, "
           + "Spread (Ta-Td) = " + String(spread, 2) + "°C, "
           + "Thresh = " + String(dewSpreadThreshold, 1) + "±" + String(dewSpreadHysteresis, 1));
+  }
+
+  // Append to persistent thermal log
+  File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
+  if (f) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s,%.2f,%.2f,%.2f,%.2f,%.2f",
+             timeStr, Ta, Tg, delta, gradientPerHour,
+             isnan(td) ? 0.0f : (Ta - td));
+    f.println(buf);
+    f.close();
   }
 
   prevTa = Ta;
@@ -666,6 +688,10 @@ void setupNTP() {
     char buf[64];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
     sendLog(String("✅ NTP time synchronized: ") + buf);
+    if (!logPruned) {
+      logPruned = true;
+      pruneThermalLog(timeinfo);
+    }
   } else {
     sendLog("⚠️ NTP not yet synchronized (will retry automatically)");
   }
@@ -706,6 +732,30 @@ void setupWebServer() {
         .inputrow { display: flex; align-items: center; margin: 5px 0; }
         .inputrow label { width: 210px; }
         .inputrow input { flex: 1; }
+        #dataModal {
+          display: none; position: fixed; top: 0; left: 0;
+          width: 100%; height: 100%; background: rgba(0,0,0,0.5);
+          z-index: 1000; justify-content: center; align-items: center;
+        }
+        #dataModal.active { display: flex; }
+        #dataModalBox {
+          background: white; border-radius: 8px; padding: 20px;
+          width: 80%; max-width: 800px; max-height: 80vh;
+          display: flex; flex-direction: column; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        #dataModalHeader {
+          display: flex; justify-content: space-between; align-items: center;
+          margin-bottom: 10px;
+        }
+        #dataModalHeader h3 { margin: 0; }
+        #dataModalContent {
+          flex: 1; overflow-y: auto; white-space: pre-wrap;
+          font-family: monospace; font-size: 0.85rem; background: #f8f8f8;
+          border: 1px solid #ccc; padding: 10px; border-radius: 4px;
+          user-select: all;
+        }
+        #dataModalButtons { display: flex; gap: 10px; margin-top: 10px; }
+        #dataModalButtons button { padding: 6px 16px; cursor: pointer; }
       </style>
 
       <script>
@@ -835,8 +885,11 @@ void setupWebServer() {
         }
 
         function showCalibration() {
-          fetch("/showcal", { method: "POST" })
-            .then(() => setTimeout(updateLog, 300));
+          fetch('/downloadcal').then(r => {
+            if (r.ok) return r.text();
+            throw new Error('No data');
+          }).then(text => showDataModal('Calibration Data', text))
+            .catch(() => showDataModal('Calibration Data', 'No calibration data found.'));
         }
 
         function toggleCalibration() {
@@ -855,6 +908,41 @@ void setupWebServer() {
               document.getElementById("log").innerText = "🧹 Clearing calibration data.";
               setTimeout(updateLog, 300);
             });
+        }
+
+        function clearThermalLog() {
+          fetch("/clearlog_thermal", { method: "POST" })
+            .then(() => {
+              document.getElementById("log").innerText = "🧹 Clearing thermal log.";
+              setTimeout(updateLog, 300);
+            });
+        }
+
+        function showThermalLog() {
+          fetch('/downloadlog').then(r => {
+            if (r.ok) return r.text();
+            throw new Error('No data');
+          }).then(text => showDataModal('Thermal Log', text))
+            .catch(() => showDataModal('Thermal Log', 'No thermal log found.'));
+        }
+
+        function showDataModal(title, content) {
+          document.getElementById('dataModalTitle').innerText = title;
+          document.getElementById('dataModalContent').innerText = content;
+          document.getElementById('dataModal').classList.add('active');
+        }
+
+        function closeDataModal() {
+          document.getElementById('dataModal').classList.remove('active');
+        }
+
+        function copyModalData() {
+          const text = document.getElementById('dataModalContent').innerText;
+          navigator.clipboard.writeText(text).then(() => {
+            const btn = document.getElementById('copyBtn');
+            btn.innerText = 'Copied!';
+            setTimeout(() => btn.innerText = 'Copy to Clipboard', 1500);
+          });
         }
 
         function toggleLogPause() {
@@ -941,11 +1029,13 @@ void setupWebServer() {
           <button type="button" onclick="clearLog()">Clear Log</button>
           <button id="pauseLogButton" type="button" onclick="toggleLogPause()">Pause Log</button>
           <button type="button" onclick="downloadCalibration()">Download Calibration CSV</button>
+          <button type="button" onclick="showThermalLog()">Show Thermal Log</button>
         </div>
 
         <!-- Row 2 -->
         <div style="display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
           <button type="button" onclick="clearCalibration()">Clear Calibration Data</button>
+          <button type="button" onclick="clearThermalLog()">Clear Thermal Log</button>
           <div style="display: flex; align-items: center; gap: 10px;">
             <label for="pwmTest">🧪 PWM Test:</label>
             <input type="range" id="pwmTest" min="0" max="100" value="0" oninput="updatePWMValue(this.value)">
@@ -955,6 +1045,18 @@ void setupWebServer() {
         </div>
       </div>
       <div id="log">Loading...</div>
+      <div id="dataModal">
+        <div id="dataModalBox">
+          <div id="dataModalHeader">
+            <h3 id="dataModalTitle"></h3>
+          </div>
+          <div id="dataModalContent"></div>
+          <div id="dataModalButtons">
+            <button id="copyBtn" onclick="copyModalData()">Copy to Clipboard</button>
+            <button onclick="closeDataModal()">Close</button>
+          </div>
+        </div>
+      </div>
       </body></html>
     )rawliteral";
     server.send(200, "text/html; charset=UTF-8", html);
@@ -1157,6 +1259,16 @@ void setupWebServer() {
     server.send(200);
   });
 
+  server.on("/clearlog_thermal", HTTP_POST, []() {
+    if (SPIFFS.exists(LOG_FILE)) {
+      SPIFFS.remove(LOG_FILE);
+      sendLog("🧹 Thermal log cleared.");
+    } else {
+      sendLog("ℹ️ No thermal log to clear.");
+    }
+    server.send(200);
+  });
+
   server.on("/downloadcal", HTTP_GET, []() {
     if (SPIFFS.exists(CALIBRATION_FILE)) {
       File f = SPIFFS.open(CALIBRATION_FILE, FILE_READ);
@@ -1164,6 +1276,35 @@ void setupWebServer() {
       f.close();
     } else {
       server.send(404, "text/plain", "Calibration file not found");
+    }
+  });
+
+  server.on("/showlog", HTTP_POST, []() {
+    File f = SPIFFS.open(LOG_FILE, FILE_READ);
+    if (!f) {
+      sendLog("❌ No thermal log found.");
+    } else {
+      sendLog("📈 Thermal Log:");
+      int lineCount = 0;
+      while (f.available()) {
+        String line = f.readStringUntil('\n');
+        sendLog("📌 " + line);
+        if (++lineCount % 10 == 0) {
+          yield();
+        }
+      }
+      f.close();
+    }
+    server.send(200);
+  });
+
+  server.on("/downloadlog", HTTP_GET, []() {
+    if (SPIFFS.exists(LOG_FILE)) {
+      File f = SPIFFS.open(LOG_FILE, FILE_READ);
+      server.streamFile(f, "text/csv");
+      f.close();
+    } else {
+      server.send(404, "text/plain", "No thermal log found");
     }
   });
 
@@ -1632,7 +1773,7 @@ void updateHeaterControl() {
     // PI control constants
     const float Kp = 20.0f;   // tune as needed
     const float Ki = 0.02f;
-    const int   PWM_MIN = 64;   // ~25% keep-alive floor while dew gate is active
+    const int   PWM_MIN = 26;   // ~10% keep-alive floor while dew gate is active
     const int   PWM_MAX = 255;
     const float integralMax = 500.0f;
 
@@ -1712,7 +1853,101 @@ void updateCalibration() {
   }
 }
 
-// Check if NTP has synced; only once per session
+void pruneThermalLog(const struct tm& timeinfo) {
+  if (!SPIFFS.exists(LOG_FILE)) {
+    // No file yet — just write session header and return
+    File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
+    if (f) {
+      char timeStr[32];
+      strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      f.println("--- Session start: " + String(timeStr) + " ---");
+      f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread");
+      f.close();
+    }
+    sendLog("📝 Thermal log created");
+    return;
+  }
+
+  File check = SPIFFS.open(LOG_FILE, FILE_READ);
+  size_t fileSize = check.size();
+  check.close();
+
+  if (fileSize > MAX_THERMAL_LOG_SIZE) {
+    // Hard cap — keep most recent half from clean line boundary
+    File src = SPIFFS.open(LOG_FILE, FILE_READ);
+    src.seek(fileSize / 2);
+    src.readStringUntil('\n');  // discard partial line
+    String kept = src.readString();
+    src.close();
+    SPIFFS.remove(LOG_FILE);
+    File dst = SPIFFS.open(LOG_FILE, FILE_WRITE);
+    if (dst) {
+      dst.print(kept);
+      dst.close();
+      sendLog("⚠️ Thermal log exceeded 32KB — oldest half removed");
+    }
+  } else if (fileSize > LOG_PRUNE_SIZE) {
+    // Date-based prune — discard entries older than 2 days
+    struct tm cutoffTime = timeinfo;
+    cutoffTime.tm_hour = 0;
+    cutoffTime.tm_min  = 0;
+    cutoffTime.tm_sec  = 0;
+    cutoffTime.tm_mday -= 2;
+    time_t cutoff = mktime(&cutoffTime);
+
+    File src = SPIFFS.open(LOG_FILE, FILE_READ);
+    String kept = "";
+    while (src.available()) {
+      String line = src.readStringUntil('\n');
+      line.trim();
+      if (line.isEmpty()) continue;
+
+      // Always keep session separators and header lines
+      if (line.startsWith("---") || line.startsWith("Time,")) {
+        kept += line + "\n";
+        continue;
+      }
+
+      // Parse timestamp from start of CSV line
+      if (line.length() >= 19) {
+        struct tm rowTime = {};
+        if (strptime(line.c_str(), "%Y-%m-%d %H:%M:%S", &rowTime)) {
+          time_t rowEpoch = mktime(&rowTime);
+          if (rowEpoch >= cutoff) {
+            kept += line + "\n";
+          }
+        } else {
+          kept += line + "\n";  // unparseable — keep it
+        }
+      } else {
+        kept += line + "\n";  // short line — keep it
+      }
+    }
+    src.close();
+
+    SPIFFS.remove(LOG_FILE);
+    File dst = SPIFFS.open(LOG_FILE, FILE_WRITE);
+    if (dst) {
+      dst.print(kept);
+      dst.close();
+      sendLog("🔄 Thermal log pruned — entries older than date-2 removed");
+    }
+  } else {
+    sendLog("📝 Thermal log OK (" + String(fileSize / 1024.0, 1) + " KB)");
+  }
+
+  // Append session separator with real timestamp
+  File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
+  if (f) {
+    char timeStr[32];
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    f.println("--- Session start: " + String(timeStr) + " ---");
+    f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread");
+    f.close();
+  }
+  sendLog("📝 Thermal log session started");
+}
+
 void handleNTP(bool forceCheck) {
   static bool timeSynced = false;
 
@@ -1725,6 +1960,12 @@ void handleNTP(bool forceCheck) {
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
     sendLog(String("✅ NTP time synchronized: ") + buf);
     timeSynced = true;  // Stop checking once synced
+
+    // Prune once on first successful NTP sync this boot
+    if (!logPruned) {
+      logPruned = true;
+      pruneThermalLog(timeinfo);
+    }
   } 
   else {
     sendLog("⚠️ NTP not yet synchronized, retrying...");
