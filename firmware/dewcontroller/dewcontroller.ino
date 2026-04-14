@@ -25,7 +25,7 @@
 #define DEBUG_MODE 0
 #endif
 
-#define DEVICE_VERSION "v4.2.0"
+#define DEVICE_VERSION "v4.3.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
@@ -463,27 +463,18 @@ void logThermalLagInfo() {
   float gradientPerHour = (Ta - prevTa) / dtSeconds * 3600.0;
   float delta = Tg - Ta;
 
-  sendLog(String("📊 Tg = ") + String(Tg, 2) +
-          "°C, Ta = " + String(Ta, 2) +
-          "°C, Tg - Ta = " + String(delta, 2) +
-          "°C, dTa/dt = " + String(gradientPerHour, 2) + " °C/hour");
-
   // Extra dew metrics
   float td = dewPointC(Ta, h);
-  if (!isnan(td)) {
-    float spread = Ta - td;
-    sendLog(String("💧 Td = ") + String(td, 2) + "°C, "
-          + "Spread (Ta-Td) = " + String(spread, 2) + "°C, "
-          + "Thresh = " + String(dewSpreadThreshold, 1) + "±" + String(dewSpreadHysteresis, 1));
-  }
 
   // Append to persistent thermal log
   File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
   if (f) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s,%.2f,%.2f,%.2f,%.2f,%.2f",
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
              timeStr, Ta, Tg, delta, gradientPerHour,
-             isnan(td) ? 0.0f : (Ta - td));
+             isnan(td) ? 0.0f : (Ta - td),
+             isnan(td) ? 0.0f : td,
+             isnan(h) ? 0.0f : h);
     f.println(buf);
     f.close();
   }
@@ -748,6 +739,11 @@ void setupWebServer() {
           margin-bottom: 10px;
         }
         #dataModalHeader h3 { margin: 0; }
+        #dataModalClose {
+          background: none; border: none; font-size: 1.5rem; cursor: pointer;
+          color: #666; padding: 0 4px; line-height: 1;
+        }
+        #dataModalClose:hover { color: #000; }
         #dataModalContent {
           flex: 1; overflow-y: auto; white-space: pre-wrap;
           font-family: monospace; font-size: 0.85rem; background: #f8f8f8;
@@ -930,6 +926,8 @@ void setupWebServer() {
           document.getElementById('dataModalTitle').innerText = title;
           document.getElementById('dataModalContent').innerText = content;
           document.getElementById('dataModal').classList.add('active');
+          const el = document.getElementById('dataModalContent');
+          setTimeout(() => { el.scrollTop = el.scrollHeight; }, 50);
         }
 
         function closeDataModal() {
@@ -938,11 +936,17 @@ void setupWebServer() {
 
         function copyModalData() {
           const text = document.getElementById('dataModalContent').innerText;
-          navigator.clipboard.writeText(text).then(() => {
-            const btn = document.getElementById('copyBtn');
-            btn.innerText = 'Copied!';
-            setTimeout(() => btn.innerText = 'Copy to Clipboard', 1500);
-          });
+          const btn = document.getElementById('copyBtn');
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          btn.innerText = 'Copied!';
+          setTimeout(() => btn.innerText = 'Copy to Clipboard', 1500);
         }
 
         function toggleLogPause() {
@@ -1049,6 +1053,7 @@ void setupWebServer() {
         <div id="dataModalBox">
           <div id="dataModalHeader">
             <h3 id="dataModalTitle"></h3>
+            <button id="dataModalClose" onclick="closeDataModal()">&times;</button>
           </div>
           <div id="dataModalContent"></div>
           <div id="dataModalButtons">
@@ -1861,7 +1866,7 @@ void pruneThermalLog(const struct tm& timeinfo) {
       char timeStr[32];
       strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
       f.println("--- Session start: " + String(timeStr) + " ---");
-      f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread");
+      f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH");
       f.close();
     }
     sendLog("📝 Thermal log created");
@@ -1942,7 +1947,7 @@ void pruneThermalLog(const struct tm& timeinfo) {
     char timeStr[32];
     strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
     f.println("--- Session start: " + String(timeStr) + " ---");
-    f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread");
+    f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH");
     f.close();
   }
   sendLog("📝 Thermal log session started");
