@@ -25,7 +25,7 @@
 #define DEBUG_MODE 0
 #endif
 
-#define DEVICE_VERSION "v4.3.0"
+#define DEVICE_VERSION "v4.4.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
@@ -121,6 +121,7 @@ String  wifiPass = "";
 // Timezone rule for TZ environment (AEST/AEDT for Sydney by default)
 String  timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 bool    heaterEnabled = false, calibrating = false;
+bool    dewGate = false;                             // global dew-gate state for logging
 
 // -------------- Calibration variables --------------
 int     calCount = 0, pwm = 0;
@@ -465,16 +466,20 @@ void logThermalLagInfo() {
 
   // Extra dew metrics
   float td = dewPointC(Ta, h);
+  float Vt = readThermistorVoltage();
+  float TgTarget = isnan(td) ? 0.0f : (td + targetDelta);
 
   // Append to persistent thermal log
   File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
   if (f) {
-    char buf[160];
-    snprintf(buf, sizeof(buf), "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
+    char buf[210];
+    snprintf(buf, sizeof(buf), "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.3f,%d,%.2f",
              timeStr, Ta, Tg, delta, gradientPerHour,
              isnan(td) ? 0.0f : (Ta - td),
              isnan(td) ? 0.0f : td,
-             isnan(h) ? 0.0f : h);
+             isnan(h) ? 0.0f : h,
+             pwm, Vt,
+             dewGate ? 1 : 0, TgTarget);
     f.println(buf);
     f.close();
   }
@@ -748,7 +753,7 @@ void setupWebServer() {
           flex: 1; overflow-y: auto; white-space: pre-wrap;
           font-family: monospace; font-size: 0.85rem; background: #f8f8f8;
           border: 1px solid #ccc; padding: 10px; border-radius: 4px;
-          user-select: all;
+          user-select: text;
         }
         #dataModalButtons { display: flex; gap: 10px; margin-top: 10px; }
         #dataModalButtons button { padding: 6px 16px; cursor: pointer; }
@@ -1228,27 +1233,6 @@ void setupWebServer() {
     server.send(200);
   });
 
-  server.on("/showcal", HTTP_POST, []() {
-    File f = SPIFFS.open(CALIBRATION_FILE, FILE_READ);
-    if (!f) {
-      sendLog("❌ No calibration data found.");
-    } else {
-      sendLog("📈 Calibration Data:");
-      int lineCount = 0;
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
-        sendLog("📌 " + line);
-        
-        // Yield every 10 lines to prevent blocking
-        if (++lineCount % 10 == 0) {
-          yield();
-        }
-      }
-      f.close();
-    }
-    server.send(200);
-  });
-
   server.on("/clearlog", HTTP_POST, []() {
     logBuffer = "🧹 Log cleared.\n";
     server.send(200);
@@ -1282,25 +1266,6 @@ void setupWebServer() {
     } else {
       server.send(404, "text/plain", "Calibration file not found");
     }
-  });
-
-  server.on("/showlog", HTTP_POST, []() {
-    File f = SPIFFS.open(LOG_FILE, FILE_READ);
-    if (!f) {
-      sendLog("❌ No thermal log found.");
-    } else {
-      sendLog("📈 Thermal Log:");
-      int lineCount = 0;
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
-        sendLog("📌 " + line);
-        if (++lineCount % 10 == 0) {
-          yield();
-        }
-      }
-      f.close();
-    }
-    server.send(200);
   });
 
   server.on("/downloadlog", HTTP_GET, []() {
@@ -1740,6 +1705,7 @@ void updateHeaterControl() {
     pwm = 0;
     pwmIntegral = 0.0;
     dewGateLatched = false;
+    dewGate = false;
     analogWrite(PWM_PIN, pwm);
     return;
   }
@@ -1749,12 +1715,12 @@ void updateHeaterControl() {
 
   // ---- Calculate dew point and control target ----
   float td = dewPointC(t, h);
-  bool dewGate = false;
 
   if (isnan(td)) {
     // If dew point cannot be computed, fail-safe OFF
     pwm = 0;
     pwmIntegral = 0.0;
+    dewGate = false;
     analogWrite(PWM_PIN, pwm);
     return;
   }
@@ -1768,7 +1734,7 @@ void updateHeaterControl() {
   } else if (dewGateLatched && spread > (dewSpreadThreshold + dewSpreadHysteresis)) {
     dewGateLatched = false;
   }
-  dewGate = dewGateLatched;
+  dewGate = dewGateLatched;  // publish to global for logging
 
   if (dewGate) {
     // Control glass to be targetDelta °C ABOVE DEW POINT (not ambient)
@@ -1866,7 +1832,7 @@ void pruneThermalLog(const struct tm& timeinfo) {
       char timeStr[32];
       strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
       f.println("--- Session start: " + String(timeStr) + " ---");
-      f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH");
+      f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH,PWM%,Vt,GateOn,TgTarget");
       f.close();
     }
     sendLog("📝 Thermal log created");
@@ -1947,7 +1913,7 @@ void pruneThermalLog(const struct tm& timeinfo) {
     char timeStr[32];
     strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
     f.println("--- Session start: " + String(timeStr) + " ---");
-    f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH");
+    f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH,PWM%,Vt,GateOn,TgTarget");
     f.close();
   }
   sendLog("📝 Thermal log session started");
