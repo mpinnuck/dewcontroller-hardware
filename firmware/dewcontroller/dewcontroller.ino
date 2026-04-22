@@ -25,7 +25,7 @@
 #define DEBUG_MODE 0
 #endif
 
-#define DEVICE_VERSION "v4.4.0"
+#define DEVICE_VERSION "v4.5.0"
 #define DEVICE_NAME "DewHeaterController"
 #define SIMULATE_HARDWARE 0
 #define CONFIG_FILE "/config.json"
@@ -217,6 +217,20 @@ String getCalibrationFileSizeKB(const char* filename) {
     result += " ⚠️";
   }
   return result;
+}
+
+// Returns local wall time if available, otherwise relative uptime since boot.
+String getStatusTimeString() {
+  struct tm timeinfo;
+  char timeStr[32];
+
+  if (getLocalTime(&timeinfo, 50)) {
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    return String(timeStr);
+  }
+
+  unsigned long secs = millis() / 1000;
+  return "+" + String(secs) + "s";
 }
 
 // Weather API (change as required)
@@ -1102,6 +1116,7 @@ void setupWebServer() {
 
     float delta = glassTemp - cached_td_local;  // Tg - Td (glass temp above dew point)
     int pwmPercent = pwm * 100 / 255;
+    String statusTime = getStatusTimeString();
 
     // Simplified JSON response - avoid heavy String operations
     String json = "{";
@@ -1119,6 +1134,7 @@ void setupWebServer() {
     json += "\"version\":\"" + String(DEVICE_VERSION) + "\",";
     json += "\"dewSpreadThreshold\":\"" + String(dewSpreadThreshold, 1) + "\",";
     json += "\"dewSpreadHysteresis\":\"" + String(dewSpreadHysteresis, 1) + "\",";
+    json += "\"time\":\"" + statusTime + "\",";
     json += "\"wifiSignal\":" + String(cached_rssi_local);
     json += "}";
     
