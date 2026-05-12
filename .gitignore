@@ -1,5 +1,7 @@
 hardware/dewcontroller/dewcontroller-backups/
+hardware/dewcontroller/.history/
 hardware/dewcontroller/fabrication/
 hardware/dewcontroller/fp-info-cache
+hardware/dewcontroller/~*.kicad_*.lck
 hardware/mechanical/backup/
 *FCBak
