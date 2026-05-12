@@ -1,12 +1,15 @@
-// DewHeaterController — Dew Spread Control
-// Replaces RH threshold gating with dew-point spread gating (Ta - Td)
-// Default dew spread threshold = 3.0 °C, hysteresis = 1.0 °C
-// Board XAIO ESP32S3 with ATH40 sensor
-
+// DewHeaterController - Environment-Driven Dew Control
+// Control is based entirely on ambient Ta, RH and computed dew-point spread.
+// The ring thermistor is retained ONLY as an over-temperature safety cutoff.
+// Board: XIAO ESP32S3 with SHT40 sensor
+//
+// Algorithm - spread table driven:
+//   Use spread = Ta - Td and lookup power% from the configured table.
+//   Max Power (%) scales the entire table output.
+// Thermistor safety: if ring exceeds RING_TEMP_CUTOFF C, PWM is clamped.
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_AHTX0.h>
 #include <Adafruit_SHT4x.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
@@ -25,57 +28,58 @@
 #define DEBUG_MODE 0
 #endif
 
-#define DEVICE_VERSION "v4.5.0"
-#define DEVICE_NAME "DewHeaterController"
-#define SIMULATE_HARDWARE 0
-#define CONFIG_FILE "/config.json"
+#define DEVICE_VERSION        "v5.0.1"
+#define DEVICE_NAME           "DewHeaterController"
+#define CONFIG_FILE           "/config.json"
+#define LOG_FILE              "/thermal.log"
+#define LOG_PRUNE_SIZE        16384       // 16 KB - date-based prune threshold
+#define MAX_THERMAL_LOG_SIZE  32768       // 32 KB - hard cap, truncates oldest half
 
-// Weather API key — rotate if this firmware is ever shared publicly
-#define WEATHER_API_KEY "5356e369de454c6f96e369de450c6f22"
-#define CALIBRATION_FILE "/calibration.csv"
-#define LOG_FILE "/thermal.log"
-#define LOG_PRUNE_SIZE 16384       // 16KB — date-based prune threshold
-#define MAX_THERMAL_LOG_SIZE 32768 // 32KB — hard cap, truncates oldest half
-#define LOOP_INTERVAL_MS 1000
-#define WEATHER_POLL_INTERVAL_MS 5 * 60 * 1000 // 300000 ms or 5 minutes
-#define WIFI_STATUS_CHECK_INTERVAL_MS 5000 // 5 seconds - faster disconnect detection
+// Weather API fallback (if SHT40 absent)
+#define WEATHER_API_KEY       "5356e369de454c6f96e369de450c6f22"
 
-// Main loop timing constants (Web/Network - runs in loop())
-#define WIFI_RECONNECT_INTERVAL_MS 10000  // 10 seconds
-#define NTP_CHECK_INTERVAL_MS 120000      // 2 minutes
-#define RSSI_UPDATE_INTERVAL_MS 120000    // 2 minutes
-#define MAIN_LOOP_DELAY_MS 25             // Main loop cycle time
-#define AP_STA_SCAN_INTERVAL_MS 30000     // 30 seconds — scan for STA SSID while in AP fallback
+// Timing
+#define WEATHER_POLL_INTERVAL_MS      300000   // 5 min
+#define WIFI_STATUS_CHECK_INTERVAL_MS   5000   // 5 s  - UI poll rate
+#define WIFI_RECONNECT_INTERVAL_MS     10000   // 10 s
+#define NTP_CHECK_INTERVAL_MS         120000   // 2 min
+#define RSSI_UPDATE_INTERVAL_MS       120000   // 2 min
+#define MAIN_LOOP_DELAY_MS                25
+#define AP_STA_SCAN_INTERVAL_MS        30000   // 30 s
+#define APP_UPDATE_INTERVAL_MS          1000   // 1 s  - heater control loop
+#define THERMAL_LOG_INTERVAL_MS       600000   // 10 min
+#define CONTROL_TASK_DELAY_MS             50
 
-// Control task timing constants (Background - runs in task)
-#define APP_UPDATE_INTERVAL_MS 1000       // 1 second - heater control loop
-#define CALIBRATION_UPDATE_INTERVAL_MS 30000  // 30 seconds - matches CAL_SAMPLE_INTERVAL_MS
-#define THERMAL_LOG_INTERVAL_MS 600000    // 10 minutes
-#define CONTROL_TASK_DELAY_MS 50          // Background control task cycle
-
-#define I2C_SDA 5
-#define I2C_SCL 6
+// Hardware
+#define I2C_SDA        5
+#define I2C_SCL        6
 #define THERMISTOR_PIN 3
-#define PWM_PIN 7
-#define LED_PIN 21
-#define ON LOW
-#define OFF HIGH
+#define PWM_PIN        7
+#define LED_PIN        21
+#define ON             LOW
+#define OFF            HIGH
 
-// default coefficients (quadratic fit: Tg = A*V² + B*V + C)
-#define GLASSCOEFFA  -23.10
-#define GLASSCOEFFB   61.95
-#define GLASSCOEFFC  -19.20
-#define GLASSCOEFFDP  2  // number of decimal places
+// Thermistor coefficients - used ONLY for ring over-temperature safety
+// Tg = A*V^2 + B*V + C  (quadratic fit from calibration)
+#define GLASSCOEFFA   -23.10f
+#define GLASSCOEFFB    61.95f
+#define GLASSCOEFFC   -19.20f
 
+// Ring over-temperature safety cutoff default (C)
+#define DEFAULT_RING_TEMP_CUTOFF   45.0f
 
+// Default hysteresis applied only when spread is increasing (risk easing)
+#define DEFAULT_SPREAD_RISE_HYST_C  0.5f
 
-// Heater defaults
-#define DEFAULT_DEWSPREAD     3.0
-#define DEWSPREAD_HYSTERISIS  1.0
+// Max power cap as a percentage of full PWM.
+#define DEFAULT_MAX_PWM_PERCENT     90     // leave 10% headroom - ring at 90% is 20.6 W
 
-#define DEFAULT_TEMPDELTA     4.0
+// Heater electrical model for UI power reference
+#define HEATER_SUPPLY_VOLTAGE       12.0f
+#define HEATER_RING_RESISTANCE_OHM   6.3f
 
-#define DEFAULT_WIFI_SSID     "AstroNetC925"
+// Default WiFi
+#define DEFAULT_WIFI_SSID   "AstroNetC925"
 
 #if DEBUG_MODE
   #define DEBUG_PRINT(x) Serial.println(x)
@@ -83,1905 +87,1420 @@
   #define DEBUG_PRINT(x) do {} while (0)
 #endif
 
+// -- Sensor source ---------------------------------------------------------
+enum SensorSource { SOURCE_SHT40, SOURCE_WEATHER };
+SensorSource sensorSource = SOURCE_SHT40;
 
-enum SensorSource {
-  SOURCE_AHT20,
-  SOURCE_SHT40,
-  SOURCE_WEATHER
-};
-SensorSource sensorSource = SOURCE_SHT40;  // Try external SHT40 first, fallback to weather  
+// -- FreeRTOS handles ------------------------------------------------------
+SemaphoreHandle_t  i2cMutex;
+SemaphoreHandle_t  cacheMutex;
+SemaphoreHandle_t  logMutex;
+TaskHandle_t       sensorTaskHandle  = NULL;
+TaskHandle_t       controlTaskHandle = NULL;
 
-SemaphoreHandle_t   i2cMutex;
-SemaphoreHandle_t   cacheMutex;
-SemaphoreHandle_t   logMutex;
-TaskHandle_t        sensorTaskHandle;
-TaskHandle_t        controlTaskHandle;
-WebServer           server(80);
-TwoWire             I2CBus = TwoWire(1);  // Dedicated I2C bus
-Adafruit_AHTX0      aht;
-Adafruit_SHT4x      sht4;
+// -- Peripheral objects ----------------------------------------------------
+WebServer        server(80);
+TwoWire          I2CBus = TwoWire(1);
+Adafruit_SHT4x   sht4;
+bool             webServerInitialized = false;
 
-bool webServerInitialized = false;  // guard against repeated route registration
+// -- Live sensor values (mutex-protected) ---------------------------------
+float ambientTemp = 0.0f, humidity = 0.0f;
 
-// -------------- Status and config variables --------------
-float ambientTemp = 0, humidity = 0, glassTemp = 0;
-float targetDelta = DEFAULT_TEMPDELTA;                    // desired (Tg - Ta)
+// -- Control state ---------------------------------------------------------
+int   pwm          = 0;
+bool  pwmTest      = false;
+bool  heaterEnabled = false;
 
-// NEW: dew-spread control (spread = Ta - Td)
-float dewSpreadThreshold  = DEFAULT_DEWSPREAD;            // default °C
-float dewSpreadHysteresis = DEWSPREAD_HYSTERISIS;         // °C to avoid chatter
+// Phase tracking (published for GUI/log)
+enum HeaterPhase { PHASE_OFF, PHASE_PREHEAT, PHASE_ACTIVE, PHASE_SATURATED };
+HeaterPhase currentPhase = PHASE_OFF;
+String phaseLabel() {
+  switch (currentPhase) {
+    case PHASE_PREHEAT:   return "Preheat";
+    case PHASE_ACTIVE:    return "Active";
+    case PHASE_SATURATED: return "Saturated";
+    default:              return "Off";
+  }
+}
 
-// Thermistor coefficients (best-fit)
-float glassCoeffA = GLASSCOEFFA;
-float glassCoeffB = GLASSCOEFFB;
-float glassCoeffC = GLASSCOEFFC;
+// -- Configuration ---------------------------------------------------------
+int    maxPwmPercent    = DEFAULT_MAX_PWM_PERCENT;
+float  spreadRiseHystC  = DEFAULT_SPREAD_RISE_HYST_C;
+float  ringTempCutoff   = DEFAULT_RING_TEMP_CUTOFF;
+String wifiSSID         = DEFAULT_WIFI_SSID;
+String wifiPass         = "";
+String timezoneRule     = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 
-String  wifiSSID = DEFAULT_WIFI_SSID;
-String  wifiPass = "";
-// Timezone rule for TZ environment (AEST/AEDT for Sydney by default)
-String  timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
-bool    heaterEnabled = false, calibrating = false;
-bool    dewGate = false;                             // global dew-gate state for logging
+// -- NTP / AP state --------------------------------------------------------
+bool           ntpInitialized   = false;
+bool           logPruned        = false;
+bool           apFallbackActive = false;
+unsigned long  apFallbackTime   = 0;
 
-// -------------- Calibration variables --------------
-int     calCount = 0, pwm = 0;
-bool    pwmTest = false;
-volatile bool calResetRequested = false;  // flag for /calibrate handler to reset statics in updateCalibration()
-const unsigned long CAL_SAMPLE_INTERVAL_MS = 30000;  // 30 seconds
-
-const int MAX_LOG_SIZE = 65536;  // 64KB log buffer - keep more startup history
-String  logBuffer;
-
-bool ntpInitialized = false;
-bool logPruned = false;                  // true after first NTP-triggered thermal log prune
-bool apFallbackActive = false;           // true when AP mode started due to STA failure
-unsigned long apFallbackTime = 0;        // millis() when AP fallback began
-const unsigned long AP_FALLBACK_COOLDOWN_MS = 300000;  // 5 minutes before retrying STA
-
-// Background task cache variables
-float cached_td = NAN;
-float cached_spread = NAN;
-String cached_calFileSize = "0 KB";
+// -- Background cache ------------------------------------------------------
+float  cached_td      = NAN;
+float  cached_spread  = NAN;
+int    cached_rssi    = -99;
 String cached_storageInfo = "0/0 KB";
-int cached_rssi = -99;
-unsigned long lastCacheUpdate = 0;
 
-// Forward declarations
+// -- In-memory log ---------------------------------------------------------
+const int MAX_LOG_SIZE = 65536;
+String    logBuffer;
+
+// -- Forward declarations --------------------------------------------------
 void setupNTP();
 void setupWebServer();
 void handleNTP(bool forceCheck = false);
 void pruneThermalLog(const struct tm& timeinfo);
+void sendLog(const String& msg);
 
+const int SPREAD_POWER_TABLE_SIZE = 6;
+float spreadPointC[SPREAD_POWER_TABLE_SIZE] = {4.0f, 3.0f, 2.0f, 1.0f, 0.5f, 0.0f};
+int spreadPowerPct[SPREAD_POWER_TABLE_SIZE] = {15, 25, 40, 65, 75, 85};
+const float DEFAULT_SPREAD_POINT_C[SPREAD_POWER_TABLE_SIZE] = {4.0f, 3.0f, 2.0f, 1.0f, 0.5f, 0.0f};
+const int DEFAULT_SPREAD_POWER_PCT[SPREAD_POWER_TABLE_SIZE] = {15, 25, 40, 65, 75, 85};
 
-// -------------- Utility --------------
+void sanitizeSpreadTable() {
+  for (int i = 0; i < SPREAD_POWER_TABLE_SIZE; i++) {
+    spreadPointC[i] = constrain(spreadPointC[i], 0.0f, 20.0f);
+    spreadPowerPct[i] = constrain(spreadPowerPct[i], 0, 100);
+  }
 
-// Utility: decode Wi-Fi status to readable string
-String wifiStatusToString(wl_status_t status) {
-  switch (status) {
-    case WL_IDLE_STATUS:      return "Idle";
-    case WL_NO_SSID_AVAIL:    return "No SSID available";
-    case WL_SCAN_COMPLETED:   return "Scan completed";
-    case WL_CONNECTED:        return "Connected";
-    case WL_CONNECT_FAILED:   return "Connect failed";
-    case WL_CONNECTION_LOST:  return "Connection lost";
-    case WL_DISCONNECTED:     return "Disconnected";
-    default:                  return "Unknown (" + String(status) + ")";
+  // Keep table ordered by descending spread so lookup interpolation is valid.
+  for (int i = 0; i < SPREAD_POWER_TABLE_SIZE - 1; i++) {
+    for (int j = 0; j < SPREAD_POWER_TABLE_SIZE - 1 - i; j++) {
+      if (spreadPointC[j] < spreadPointC[j + 1]) {
+        float sTmp = spreadPointC[j];
+        spreadPointC[j] = spreadPointC[j + 1];
+        spreadPointC[j + 1] = sTmp;
+        int pTmp = spreadPowerPct[j];
+        spreadPowerPct[j] = spreadPowerPct[j + 1];
+        spreadPowerPct[j + 1] = pTmp;
+      }
+    }
   }
 }
 
-// Logs the current WiFi.status() with a readable message
-void logWiFiStatus(const String& prefix = "WiFi") {
-  wl_status_t status = WiFi.status();
-  String msg = wifiStatusToString(status);
+// ==========================================================================
+//  UTILITY
+// ==========================================================================
 
-  if (status == WL_CONNECTED) {
-    msg += " (" + WiFi.localIP().toString() + ", RSSI " + String(WiFi.RSSI()) + " dBm)";
+String wifiStatusToString(wl_status_t s) {
+  switch (s) {
+    case WL_IDLE_STATUS:     return "Idle";
+    case WL_NO_SSID_AVAIL:   return "No SSID available";
+    case WL_SCAN_COMPLETED:  return "Scan completed";
+    case WL_CONNECTED:       return "Connected";
+    case WL_CONNECT_FAILED:  return "Connect failed";
+    case WL_CONNECTION_LOST: return "Connection lost";
+    case WL_DISCONNECTED:    return "Disconnected";
+    default:                 return "Unknown (" + String(s) + ")";
   }
-
-  sendLog(prefix + " → " + msg);
 }
 
-// Apply timezone rule locally, even without NTP (used in AP mode)
 void applyLocalTimezone() {
-  if (timezoneRule.isEmpty()) {
-    timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
-    sendLog("⚙️ No timezone rule found — defaulting to Australia/Sydney");
-  }
-
+  if (timezoneRule.isEmpty()) timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
   setenv("TZ", timezoneRule.c_str(), 1);
   tzset();
-
-  sendLog("🕒 Local timezone applied: " + timezoneRule);
+  sendLog("Timezone applied: " + timezoneRule);
 }
 
 String getStorageUsedSummary() {
-  size_t total = SPIFFS.totalBytes();
-  size_t used = SPIFFS.usedBytes();
-
-  float usedKB = used / 1024.0;
-  float totalKB = total / 1024.0;
-
-  return String(usedKB, 1) + "/" + String(totalKB, 1) + " KB";
+  float used  = SPIFFS.usedBytes()  / 1024.0f;
+  float total = SPIFFS.totalBytes() / 1024.0f;
+  return String(used, 1) + "/" + String(total, 1) + " KB";
 }
 
-String getCalibrationFileSizeKB(const char* filename) {
-  if (!SPIFFS.exists(filename)) {
-    return "0 KB";
-  }
-  File f = SPIFFS.open(filename, FILE_READ);
-  size_t size = f.size();
-  f.close();
-  float sizeKB = size / 1024.0;
-  String result = String(sizeKB, 1) + " KB";
-  if (sizeKB > 200.0) {
-    result += " ⚠️";
-  }
-  return result;
-}
-
-// Returns local wall time if available, otherwise relative uptime since boot.
 String getStatusTimeString() {
-  struct tm timeinfo;
-  char timeStr[32];
-
-  if (getLocalTime(&timeinfo, 50)) {
-    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    return String(timeStr);
+  struct tm ti;
+  char buf[32];
+  if (getLocalTime(&ti, 50)) {
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+    return String(buf);
   }
-
-  unsigned long secs = millis() / 1000;
-  return "+" + String(secs) + "s";
+  return "+" + String(millis() / 1000) + "s";
 }
 
-// Weather API (change as required)
-const char* WEATHER_API_URL = "https://api.weather.com/v2/pws/observations/current?stationId=ISYDNEY478&format=json&units=m&apiKey=" WEATHER_API_KEY;
-
-// Write ambient temp and humidity under mutex for cross-core safety
-void writeSensorValues(float newTemp, float newHumidity) {
-  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-    ambientTemp = newTemp;
-    humidity = newHumidity;
-    xSemaphoreGive(i2cMutex);
-  }
+float heaterMaxPowerW() {
+  return (HEATER_SUPPLY_VOLTAGE * HEATER_SUPPLY_VOLTAGE) / HEATER_RING_RESISTANCE_OHM;
 }
 
-// Read ambient temp and humidity under mutex for cross-core safety
-void readSensorValues(float &outTemp, float &outHumidity) {
-  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
-    outTemp = ambientTemp;
-    outHumidity = humidity;
-    xSemaphoreGive(i2cMutex);
-  } else {
-    outTemp = ambientTemp;
-    outHumidity = humidity;
+float lookupSpreadTablePowerPct(float spread) {
+  if (isnan(spread)) return 0.0f;
+  if (spread > spreadPointC[0]) return 0.0f;
+  if (spread <= spreadPointC[SPREAD_POWER_TABLE_SIZE - 1])
+    return (float)spreadPowerPct[SPREAD_POWER_TABLE_SIZE - 1];
+
+  for (int i = 0; i < SPREAD_POWER_TABLE_SIZE - 1; i++) {
+    float sHi = spreadPointC[i];
+    float sLo = spreadPointC[i + 1];
+    if (spread <= sHi && spread > sLo) {
+      float pHi = (float)spreadPowerPct[i];
+      float pLo = (float)spreadPowerPct[i + 1];
+      float t = (sHi - spread) / (sHi - sLo);
+      return pHi + (pLo - pHi) * t;
+    }
   }
+  return 0.0f;
 }
 
-// Magnus formula for dew point (Celsius)
+// Magnus formula dew point
 float dewPointC(float T, float RH) {
   if (isnan(T) || isnan(RH) || RH <= 0.0f) return NAN;
-  const float a = 17.62f;
-  const float b = 243.12f; // °C
-  float gamma = (a * T) / (b + T) + log(RH / 100.0f);
-  return (b * gamma) / (a - gamma);
+  const float a = 17.62f, b = 243.12f;
+  float g = (a * T) / (b + T) + logf(RH / 100.0f);
+  return (b * g) / (a - g);
+}
+
+// Thermistor voltage -> ring temperature (safety use only)
+float readRingTemp() {
+  float V = analogRead(THERMISTOR_PIN) * 3.3f / 4095.0f;
+  return (GLASSCOEFFA * V * V) + (GLASSCOEFFB * V) + GLASSCOEFFC;
 }
 
 void sendLog(const String& msg) {
-  char timeStr[32];  // Local buffer - not static to prevent corruption
-  struct tm timeinfo;
+  char buf[32];
+  struct tm ti;
+  if (getLocalTime(&ti, 50)) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+  else snprintf(buf, sizeof(buf), "+%lus", millis() / 1000);
 
-  // Use current local time if available, otherwise show boot time
-  if (getLocalTime(&timeinfo, 50)) {  // short timeout
-    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  } else {
-    // Before NTP sync, show time since boot
-    unsigned long secs = millis() / 1000;
-    snprintf(timeStr, sizeof(timeStr), "+%lus", secs);
-  }
+  String line = "[" + String(buf) + "] " + msg;
+  DEBUG_PRINT(line);
 
-  String logLine = "[" + String(timeStr) + "] " + msg;
-  DEBUG_PRINT(logLine);
-
-  // Protect logBuffer from concurrent access by multiple cores/tasks
   if (logMutex && xSemaphoreTake(logMutex, pdMS_TO_TICKS(100))) {
-    logBuffer += logLine + "\n";
-    if (logBuffer.length() > MAX_LOG_SIZE) {
+    logBuffer += line + "\n";
+    if ((int)logBuffer.length() > MAX_LOG_SIZE)
       logBuffer = logBuffer.substring(logBuffer.length() - MAX_LOG_SIZE);
-    }
     xSemaphoreGive(logMutex);
-  } else {
-    // If mutex not available yet (early startup) or timeout, just print to serial
-    DEBUG_PRINT("⚠️ Log mutex unavailable");
   }
 }
+
+// ==========================================================================
+//  SENSOR I/O
+// ==========================================================================
+
+void writeSensorValues(float t, float h) {
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+    ambientTemp = t; humidity = h;
+    xSemaphoreGive(i2cMutex);
+  }
+}
+
+void readSensorValues(float& t, float& h) {
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10))) {
+    t = ambientTemp; h = humidity;
+    xSemaphoreGive(i2cMutex);
+  } else { t = ambientTemp; h = humidity; }
+}
+
+// ==========================================================================
+//  WEATHER API FALLBACK
+// ==========================================================================
+
+const char* WEATHER_API_URL =
+  "https://api.weather.com/v2/pws/observations/current"
+  "?stationId=ISYDNEY478&format=json&units=m&apiKey=" WEATHER_API_KEY;
 
 bool fetchOutdoorWeather(float* outTemp, float* outHumidity) {
   HTTPClient http;
   http.begin(WEATHER_API_URL);
-
-  int httpCode = http.GET();
-  if (httpCode == 200) {
-    String payload = http.getString();
-
-    StaticJsonDocument<2048> doc;
-    DeserializationError err = deserializeJson(doc, payload);
-
-    if (err) {
-      sendLog("❌ JSON parse error: " + String(err.c_str()));
-      http.end();
-      return false;
-    }
-
-    JsonObject obsRoot = doc["observations"][0];
-    JsonObject metric = obsRoot["metric"];
-
-    if (obsRoot.isNull() || metric.isNull()) {
-      sendLog("❌ Weather API missing required data.");
-      http.end();
-      return false;
-    }
-
-    float temp = metric["temp"] | NAN;
-    float hum  = obsRoot["humidity"] | NAN;  // fixed
-
-    // Data extracted - values displayed in main window
-
-    if (!isnan(temp) && !isnan(hum)) {
-      *outTemp = temp;
-      *outHumidity = hum;
-      http.end();
-      return true;
-    } else {
-      sendLog("❌ Weather API returned invalid values.");
-      http.end();
-      return false;
-    }
-  } else {
-    sendLog("❌ Weather API HTTP error: " + String(httpCode));
-    http.end();
-    return false;
+  int code = http.GET();
+  if (code != 200) {
+    sendLog("Weather API HTTP error: " + String(code));
+    http.end(); return false;
   }
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<2048> doc;
+  if (deserializeJson(doc, payload)) { sendLog("Weather JSON parse error"); return false; }
+
+  JsonObject obs    = doc["observations"][0];
+  JsonObject metric = obs["metric"];
+  if (obs.isNull() || metric.isNull()) { sendLog("Weather API missing data"); return false; }
+
+  float t = metric["temp"] | NAN;
+  float h = obs["humidity"]  | NAN;
+  if (!isnan(t) && !isnan(h)) { *outTemp = t; *outHumidity = h; return true; }
+  sendLog("Weather API invalid values");
+  return false;
 }
 
-void saveConfig() {
-  // Synchronous save with atomic write to prevent corruption
-  StaticJsonDocument<512> doc;
-  doc["delta"] = targetDelta;
-  doc["dewSpread"] = dewSpreadThreshold;
-  doc["dewSpreadHysteresis"] = dewSpreadHysteresis;
-  doc["glassCoeffA"] = glassCoeffA;
-  doc["glassCoeffB"] = glassCoeffB;
-  doc["glassCoeffC"] = glassCoeffC;
-  doc["heater"] = heaterEnabled;
-  doc["ssid"] = wifiSSID;
-  doc["password"] = wifiPass;
-  doc["timezoneRule"] = timezoneRule;
+// ==========================================================================
+//  CONFIG
+// ==========================================================================
 
-  // Write to temporary file first (atomic operation)
-  const char* tempFile = "/config.tmp";
-  File file = SPIFFS.open(tempFile, FILE_WRITE);
-  if (!file) {
-    sendLog("❌ Failed to open temp config file");
-    return;
-  }
-  
-  size_t bytesWritten = serializeJson(doc, file);
-  file.close();
-  
-  if (bytesWritten == 0) {
-    sendLog("❌ Failed to write config");
-    SPIFFS.remove(tempFile);
-    return;
-  }
-  
-  // Atomic rename - if this fails, old config is still intact
+void saveConfig() {
+  StaticJsonDocument<512> doc;
+  doc["maxPwmPercent"] = maxPwmPercent;
+  doc["spreadRiseHystC"] = spreadRiseHystC;
+  doc["ringTempCutoff"] = ringTempCutoff;
+  doc["s1"] = spreadPointC[0]; doc["p1"] = spreadPowerPct[0];
+  doc["s2"] = spreadPointC[1]; doc["p2"] = spreadPowerPct[1];
+  doc["s3"] = spreadPointC[2]; doc["p3"] = spreadPowerPct[2];
+  doc["s4"] = spreadPointC[3]; doc["p4"] = spreadPowerPct[3];
+  doc["s5"] = spreadPointC[4]; doc["p5"] = spreadPowerPct[4];
+  doc["s6"] = spreadPointC[5]; doc["p6"] = spreadPowerPct[5];
+  doc["heater"]        = heaterEnabled;
+  doc["ssid"]          = wifiSSID;
+  doc["password"]      = wifiPass;
+  doc["timezoneRule"]  = timezoneRule;
+
+  const char* tmp = "/config.tmp";
+  File f = SPIFFS.open(tmp, FILE_WRITE);
+  if (!f) { sendLog("Failed to open temp config"); return; }
+  size_t n = serializeJson(doc, f);
+  f.close();
+  if (!n) { sendLog("Config write failed"); SPIFFS.remove(tmp); return; }
   SPIFFS.remove(CONFIG_FILE);
-  SPIFFS.rename(tempFile, CONFIG_FILE);
-  
-  sendLog("💾 Config saved (" + String(bytesWritten) + " bytes)");
+  SPIFFS.rename(tmp, CONFIG_FILE);
+  sendLog("Config saved (" + String(n) + " bytes)");
 }
 
 void loadConfig() {
-  if (!SPIFFS.exists(CONFIG_FILE)) {
-    sendLog("⚠️ No config found, using defaults");
-    return;
-  }
-
-  File file = SPIFFS.open(CONFIG_FILE, FILE_READ);
-  if (!file) {
-    sendLog("❌ Failed to open config file");
-    return;
-  }
-
+  if (!SPIFFS.exists(CONFIG_FILE)) { sendLog("No config - using defaults"); return; }
+  File f = SPIFFS.open(CONFIG_FILE, FILE_READ);
+  if (!f) { sendLog("Failed to open config"); return; }
   StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, file);
-  file.close();
-
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
   if (err) {
-    sendLog("❌ Failed to parse config: " + String(err.c_str()));
-    
-    // Delete corrupted config file and use defaults
+    sendLog("Config parse error: " + String(err.c_str()));
     if (err == DeserializationError::EmptyInput || err == DeserializationError::InvalidInput) {
-      sendLog("🗑 Deleting corrupted config file");
       SPIFFS.remove(CONFIG_FILE);
-      sendLog("⚠️ Using defaults - please reconfigure via web interface");
+      sendLog("Corrupted config deleted - using defaults");
     }
     return;
   }
+  maxPwmPercent = doc["maxPwmPercent"] | DEFAULT_MAX_PWM_PERCENT;
+  spreadRiseHystC = doc["spreadRiseHystC"] | DEFAULT_SPREAD_RISE_HYST_C;
+  ringTempCutoff = doc["ringTempCutoff"] | DEFAULT_RING_TEMP_CUTOFF;
+  spreadPointC[0] = doc["s1"] | DEFAULT_SPREAD_POINT_C[0];
+  spreadPointC[1] = doc["s2"] | DEFAULT_SPREAD_POINT_C[1];
+  spreadPointC[2] = doc["s3"] | DEFAULT_SPREAD_POINT_C[2];
+  spreadPointC[3] = doc["s4"] | DEFAULT_SPREAD_POINT_C[3];
+  spreadPointC[4] = doc["s5"] | DEFAULT_SPREAD_POINT_C[4];
+  spreadPointC[5] = doc["s6"] | DEFAULT_SPREAD_POINT_C[5];
+  spreadPowerPct[0] = doc["p1"] | DEFAULT_SPREAD_POWER_PCT[0];
+  spreadPowerPct[1] = doc["p2"] | DEFAULT_SPREAD_POWER_PCT[1];
+  spreadPowerPct[2] = doc["p3"] | DEFAULT_SPREAD_POWER_PCT[2];
+  spreadPowerPct[3] = doc["p4"] | DEFAULT_SPREAD_POWER_PCT[3];
+  spreadPowerPct[4] = doc["p5"] | DEFAULT_SPREAD_POWER_PCT[4];
+  spreadPowerPct[5] = doc["p6"] | DEFAULT_SPREAD_POWER_PCT[5];
 
-  targetDelta          = doc["delta"]               | DEFAULT_TEMPDELTA;
-  dewSpreadThreshold   = doc["dewSpread"]           | DEFAULT_DEWSPREAD;        // default
-  dewSpreadHysteresis  = doc["dewSpreadHysteresis"] | DEWSPREAD_HYSTERISIS;     // default
+  maxPwmPercent = constrain(maxPwmPercent, 10, 100);
+  spreadRiseHystC = constrain(spreadRiseHystC, 0.0f, 3.0f);
+  ringTempCutoff = constrain(ringTempCutoff, 20.0f, 90.0f);
+  sanitizeSpreadTable();
 
-  // Back-compat for older configs that only had "humidity" key:
-  if (!doc.containsKey("dewSpread") && doc.containsKey("humidity")) {
-    dewSpreadThreshold = DEFAULT_DEWSPREAD; // migrate to sensible default
-  }
+  heaterEnabled = doc["heater"]       | false;
+  wifiSSID      = doc["ssid"]         | "";
+  wifiPass      = doc["password"]     | "";
+  timezoneRule  = doc["timezoneRule"] | "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 
-  heaterEnabled       = doc["heater"]       | false;
-  wifiSSID            = doc["ssid"]         | "";
-  wifiPass            = doc["password"]     | "";
-  timezoneRule        = doc["timezoneRule"] | "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
-
-  sendLog("✅ Config loaded from SPIFFS");
-  sendLog(" Temperature Delta: " + String(targetDelta, 2));
-  sendLog("📦 Dew Spread Threshold: " + String(dewSpreadThreshold, 2) + " °C");
-  sendLog("📦 Dew Spread Hysteresis: " + String(dewSpreadHysteresis, 2) + " °C");
-  sendLog("📦 Heater Enabled: " + String(heaterEnabled ? "true" : "false"));
-  sendLog("📦 WiFi SSID: " + wifiSSID);
-  sendLog("📦 Timezone Rule: " + timezoneRule);
-  sendLog("📦 Tg = A·V² + B·V + C");
-  sendLog("📦 A = " + String(glassCoeffA, GLASSCOEFFDP));
-  sendLog("📦 B = " + String(glassCoeffB, GLASSCOEFFDP));
-  sendLog("📦 C = " + String(glassCoeffC, GLASSCOEFFDP));
+  sendLog("Config loaded");
+  sendLog("   Max Power (%): " + String(maxPwmPercent));
+  sendLog("   Rise Hysteresis (C): " + String(spreadRiseHystC, 2));
+    sendLog("   Table: [" + String(spreadPointC[0], 2) + "->" + String(spreadPowerPct[0]) + "%, " +
+      String(spreadPointC[1], 2) + "->" + String(spreadPowerPct[1]) + "%, " +
+      String(spreadPointC[2], 2) + "->" + String(spreadPowerPct[2]) + "%, " +
+      String(spreadPointC[3], 2) + "->" + String(spreadPowerPct[3]) + "%, " +
+      String(spreadPointC[4], 2) + "->" + String(spreadPowerPct[4]) + "%, " +
+      String(spreadPointC[5], 2) + "->" + String(spreadPowerPct[5]) + "%]");
+  sendLog("   Ring Temp Cutoff: " + String(ringTempCutoff, 1));
+  sendLog("   Heater: "       + String(heaterEnabled ? "enabled" : "disabled"));
+  sendLog("   WiFi SSID: "    + wifiSSID);
+  sendLog("   Timezone: "     + timezoneRule);
 }
 
-float readThermistorVoltage() {
-  return analogRead(THERMISTOR_PIN) * 3.3 / 4095.0;
-}
+// ==========================================================================
+//  ENVIRONMENT-DRIVEN HEATER CONTROL
+//
+//  No thermistor feedback for control. Power is a pure function of:
+//    spread = Ta - Td   (computed from SHT40 Ta and RH)
+//    spread->power table, scaled by Max Power (%)
+//
+//  Thermistor used only for ring over-temperature safety cutoff.
+// ==========================================================================
 
-float readGlassTemp() {
-  float V = readThermistorVoltage();
-  return (glassCoeffA * V * V) + (glassCoeffB * V) + glassCoeffC;
-}
+void updateHeaterControl() {
+  static float lastSpread = NAN;
 
-// Called every LOOP_INTERVAL_MS
-void updateGlassTemp() {
-  glassTemp = readGlassTemp();
-}
+  if (pwmTest) return;  // manual override active
 
-// Log thermal lag periodically - now called less frequently from main loop
-void logThermalLagInfo() {
-  char timeStr[32] = "??";
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  }
-
-  static float prevTa = 0.0;
-  static unsigned long prevTime = 0;
-
-  float Ta, h;
-  readSensorValues(Ta, h);
-  float Tg = glassTemp;
-
-  unsigned long now = millis();
-
-  // Initialize on first call
-  if (prevTime == 0) {
-    prevTa = Ta;
-    prevTime = now;
+  if (!heaterEnabled) {
+    pwm = 0;
+    currentPhase = PHASE_OFF;
+    analogWrite(PWM_PIN, 0);
+    lastSpread = NAN;
     return;
   }
 
-  float dtSeconds = (now - prevTime) / 1000.0;
-  float gradientPerHour = (Ta - prevTa) / dtSeconds * 3600.0;
-  float delta = Tg - Ta;
+  float Ta, RH;
+  readSensorValues(Ta, RH);
 
-  // Extra dew metrics
-  float td = dewPointC(Ta, h);
-  float Vt = readThermistorVoltage();
-  float TgTarget = isnan(td) ? 0.0f : (td + targetDelta);
+  float Td = dewPointC(Ta, RH);
+  if (isnan(Td) || isnan(Ta)) {
+    // Cannot compute dew point - fail safe OFF
+    pwm = 0;
+    currentPhase = PHASE_OFF;
+    analogWrite(PWM_PIN, 0);
+    lastSpread = NAN;
+    sendLog("Heater control: invalid sensor data - heater off");
+    return;
+  }
 
-  // Append to persistent thermal log
+  float spread = Ta - Td;
+
+  // Apply hysteresis only while spread is rising to avoid rapid power drop-offs.
+  float lookupSpread = spread;
+  if (!isnan(lastSpread) && spread > lastSpread) {
+    lookupSpread = max(0.0f, spread - spreadRiseHystC);
+  }
+  lastSpread = spread;
+
+  // -- Spread table + max power scaling -----------------------------------
+  float tablePct = lookupSpreadTablePowerPct(lookupSpread); // 0-100%
+  float effectivePct = tablePct * ((float)maxPwmPercent / 100.0f);
+  int targetPWM = (int)roundf((effectivePct / 100.0f) * 255.0f);
+
+  if (tablePct <= 0.0f) currentPhase = PHASE_OFF;
+  else if (spread > spreadPointC[2]) currentPhase = PHASE_PREHEAT;
+  else if (spread > spreadPointC[SPREAD_POWER_TABLE_SIZE - 2]) currentPhase = PHASE_ACTIVE;
+  else currentPhase = PHASE_SATURATED;
+
+  // -- Ring over-temperature safety cutoff --------------------------------
+  // Thermistor ONLY used here - not for control target
+  float ringTemp = readRingTemp();
+  if (!isnan(ringTemp) && ringTemp > ringTempCutoff) {
+    // Ring too hot - clamp to 20% regardless of algorithm output
+    targetPWM = min(targetPWM, (int)(0.20f * 255.0f));
+    sendLog("Ring over-temp (" + String(ringTemp, 1) + "C) - PWM clamped");
+  }
+
+  pwm = constrain(targetPWM, 0, 255);
+  analogWrite(PWM_PIN, pwm);
+}
+
+// ==========================================================================
+//  THERMAL LOG  (retained for analysis)
+// ==========================================================================
+
+void logThermalData() {
+  struct tm ti;
+  char timeStr[32] = "??";
+  if (getLocalTime(&ti)) strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &ti);
+
+  float Ta, RH;
+  readSensorValues(Ta, RH);
+  float Td     = dewPointC(Ta, RH);
+  float spread = isnan(Td) ? NAN : (Ta - Td);
+  float ringT  = readRingTemp();
+  int   pwmPct = (int)lroundf(((float)pwm * 100.0f) / 255.0f);
+
   File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
   if (f) {
-    char buf[210];
-    snprintf(buf, sizeof(buf), "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.3f,%d,%.2f",
-             timeStr, Ta, Tg, delta, gradientPerHour,
-             isnan(td) ? 0.0f : (Ta - td),
-             isnan(td) ? 0.0f : td,
-             isnan(h) ? 0.0f : h,
-             pwm, Vt,
-             dewGate ? 1 : 0, TgTarget);
+    char buf[200];
+    snprintf(buf, sizeof(buf),
+             "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%s,%.3f",
+             timeStr,
+             Ta,
+             isnan(Td)     ? 0.0f : Td,
+             isnan(spread) ? 0.0f : spread,
+             RH,
+             ringT,
+             pwmPct,
+             phaseLabel().c_str(),
+             analogRead(THERMISTOR_PIN) * 3.3f / 4095.0f);
     f.println(buf);
     f.close();
   }
-
-  prevTa = Ta;
-  prevTime = now;
 }
+
+void pruneThermalLog(const struct tm& timeinfo) {
+  if (!SPIFFS.exists(LOG_FILE)) {
+    File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
+    if (f) {
+      char ts[32];
+      strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      f.println("--- Session start: " + String(ts) + " ---");
+      f.println("Time,Ta,Td,Spread,RH,RingTemp,PWM%,Phase,Vt");
+      f.close();
+    }
+    sendLog("Thermal log created");
+    return;
+  }
+
+  File check = SPIFFS.open(LOG_FILE, FILE_READ);
+  size_t sz = check.size();
+  check.close();
+
+  if (sz > MAX_THERMAL_LOG_SIZE) {
+    File src = SPIFFS.open(LOG_FILE, FILE_READ);
+    src.seek(sz / 2);
+    src.readStringUntil('\n');
+    String kept = src.readString();
+    src.close();
+    SPIFFS.remove(LOG_FILE);
+    File dst = SPIFFS.open(LOG_FILE, FILE_WRITE);
+    if (dst) { dst.print(kept); dst.close(); }
+    sendLog("Thermal log exceeded 32KB - oldest half removed");
+  } else if (sz > LOG_PRUNE_SIZE) {
+    struct tm cutoff = timeinfo;
+    cutoff.tm_mday -= 2; cutoff.tm_hour = 0; cutoff.tm_min = 0; cutoff.tm_sec = 0;
+    time_t cutoffEpoch = mktime(&cutoff);
+
+    File src = SPIFFS.open(LOG_FILE, FILE_READ);
+    String kept = "";
+    while (src.available()) {
+      String line = src.readStringUntil('\n'); line.trim();
+      if (line.isEmpty()) continue;
+      if (line.startsWith("---") || line.startsWith("Time,")) { kept += line + "\n"; continue; }
+      if (line.length() >= 19) {
+        struct tm rt = {};
+        if (strptime(line.c_str(), "%Y-%m-%d %H:%M:%S", &rt) && mktime(&rt) >= cutoffEpoch)
+          kept += line + "\n";
+      } else kept += line + "\n";
+    }
+    src.close();
+    SPIFFS.remove(LOG_FILE);
+    File dst = SPIFFS.open(LOG_FILE, FILE_WRITE);
+    if (dst) { dst.print(kept); dst.close(); }
+    sendLog("Thermal log pruned - entries older than 2 days removed");
+  } else {
+    sendLog("Thermal log OK (" + String(sz / 1024.0f, 1) + " KB)");
+  }
+
+  File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
+  if (f) {
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    f.println("--- Session start: " + String(ts) + " ---");
+    f.println("Time,Ta,Td,Spread,RH,RingTemp,PWM%,Phase,Vt");
+    f.close();
+  }
+  sendLog("Thermal log session started");
+}
+
+// ==========================================================================
+//  WiFi
+// ==========================================================================
 
 void setupWiFi() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // Check if we have valid WiFi credentials
   if (wifiSSID.isEmpty() || wifiPass.isEmpty()) {
-    sendLog("⚠️ No WiFi credentials configured - starting in AP mode");
+    sendLog("No WiFi credentials - starting AP mode");
     WiFi.mode(WIFI_AP);
     WiFi.softAP("DewHeaterSetup");
-    IPAddress apIP = WiFi.softAPIP();
-    sendLog("📡 AP mode started — connect to SSID 'DewHeaterSetup'");
-    sendLog("📶 AP IP address: " + apIP.toString());
+    sendLog("AP: connect to 'DewHeaterSetup' -> " + WiFi.softAPIP().toString());
     applyLocalTimezone();
     setupWebServer();
     return;
   }
 
-  sendLog("🔌 Connecting to Wi-Fi SSID: " + wifiSSID + "...");
-
-  // --- Step 1: Clean disconnect and setup STA mode ---
-  WiFi.disconnect(true, true);
-  delay(200);
+  sendLog("Connecting to: " + wifiSSID);
+  WiFi.disconnect(true, true); delay(200);
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Stronger signal for tough 2G routers
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  // --- Step 1.5: TPG Router-specific hostname setup ---
-  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-  int attempts = 0;
-  while (!netif && attempts++ < 10) {  // wait up to ~1s for interface
-    delay(100);
-    netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-  }
-
+  esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  for (int i = 0; !netif && i < 10; i++) { delay(100); netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"); }
   if (netif) {
-    // Stop DHCP before changing hostname
-    esp_netif_dhcpc_stop(netif);
-    delay(100);  // Extra delay for TPG routers
-
-    // Set hostname on the ESP network interface - try shorter name for TPG
+    esp_netif_dhcpc_stop(netif); delay(100);
     esp_netif_set_hostname(netif, "DewController");
-    sendLog("🏷 Hostname set via esp_netif before DHCP: DewController");
-
-    // Force clear any cached DHCP state for TPG compatibility
     esp_netif_dhcpc_start(netif);
-  } else {
-    sendLog("⚠️ Failed to set hostname — esp_netif not ready");
   }
-
-  // Set Arduino layer hostname
   WiFi.setHostname("DewController");
-
-  // --- Step 2: Begin initial connection ---
   WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-  delay(500); // short warm-up
+  delay(500);
 
-  const int maxRetries = 40;  // total loop time ≈ 40s
-  int retries = 0;
-  wl_status_t lastStatus = WL_IDLE_STATUS;
-
-  // --- Step 3: Poll connection progress safely ---
-  sendLog("⏳ Waiting for Wi-Fi connection...");
-  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
-    wl_status_t status = WiFi.status();
-
-    // Log only when status changes
-    if (status != lastStatus) {
-      sendLog("⏳ Wi-Fi status: " + wifiStatusToString(status));
-      lastStatus = status;
-    }
-
-    // Do not manually reset or reconnect here — let the stack retry itself
+  // Wait up to 40 s
+  wl_status_t last = WL_IDLE_STATUS;
+  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
+    wl_status_t s = WiFi.status();
+    if (s != last) { sendLog("Waiting: " + wifiStatusToString(s)); last = s; }
     delay(1000);
-    retries++;
   }
 
-  // --- Step 4: Handle success immediately ---
+  // Grace period 15 s
+  if (WiFi.status() != WL_CONNECTED) {
+    sendLog("Grace period...");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 15000 && WiFi.status() != WL_CONNECTED) delay(1000);
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     digitalWrite(LED_PIN, HIGH);
-    sendLog("✅ Wi-Fi connected");
-    sendLog("🌐 IP address: " + WiFi.localIP().toString());
-    sendLog("📶 RSSI: " + String(WiFi.RSSI()) + " dBm");
-
-    if (!MDNS.begin("DewController")) {
-      sendLog("❌ mDNS failed to start!");
-    } else {
-      sendLog("✅ mDNS responder started as DewController.local");
-      yield();
-    }
-
-    // Initialize NTP only once
-    if (!ntpInitialized) {
-      setupNTP();
-      ntpInitialized = true;
-    } else {
-      sendLog("⏱ NTP already active — skipping reinit");
-    }
-
+    sendLog("WiFi: " + WiFi.localIP().toString() + " RSSI " + String(WiFi.RSSI()) + " dBm");
+    if (!MDNS.begin("DewController")) sendLog("mDNS failed");
+    else sendLog("mDNS: DewController.local");
+    if (!ntpInitialized) { setupNTP(); ntpInitialized = true; }
     setupWebServer();
     return;
   }
 
-  // --- Step 5: Grace period for late DHCP ---
-  sendLog("⚠️ Connection not confirmed after " + String(maxRetries) + " attempts.");
-  sendLog("⏱ Waiting up to 15 more seconds for late DHCP...");
-
-  unsigned long graceStart = millis();
-  bool connected = false;
-  while (millis() - graceStart < 15000) {
-    if (WiFi.status() == WL_CONNECTED) {
-      connected = true;
-      break;
-    }
-    delay(1000);
-  }
-
-  if (connected) {
-    sendLog("✅ Late Wi-Fi success detected!");
-    digitalWrite(LED_PIN, HIGH);
-    sendLog("🌐 IP address: " + WiFi.localIP().toString());
-    sendLog("📶 RSSI: " + String(WiFi.RSSI()) + " dBm");
-
-    if (!MDNS.begin("DewController")) {
-      sendLog("❌ mDNS failed to start!");
-    } else {
-      sendLog("✅ mDNS responder started as DewController.local");
-      yield();
-    }
-
-    applyLocalTimezone();
-
-    if (!ntpInitialized) {
-      setupNTP();
-      ntpInitialized = true;
-    } else {
-      sendLog("⏱ NTP already active — skipping reinit");
-    }
-
-    setupWebServer();
-    return;
-  }
-
-  // --- Step 6: Fallback to AP mode ---
-  sendLog("❌ Wi-Fi connection failed after extended wait. Switching to Access Point mode...");
-  apFallbackActive = true;
-  apFallbackTime = millis();
-
-  // Clean teardown of STA before starting AP — prevents radio state issues
-  WiFi.disconnect(true, true);  // disconnect + erase STA credentials from RAM
-  delay(200);
-  WiFi.mode(WIFI_OFF);          // fully power down WiFi radio
-  delay(500);                    // let radio settle
-  WiFi.mode(WIFI_AP);           // start fresh in AP mode
-  delay(200);
-  WiFi.softAP("DewHeaterSetup");
-  delay(500);                    // let AP stabilize before checking IP
-
-  IPAddress apIP = WiFi.softAPIP();
-  if (apIP == IPAddress(0, 0, 0, 0)) {
-    sendLog("⚠️ AP IP is 0.0.0.0 — retrying softAP...");
-    WiFi.softAP("DewHeaterSetup");
-    delay(1000);
-    apIP = WiFi.softAPIP();
-  }
-  sendLog("📡 AP mode started — connect to SSID 'DewHeaterSetup'");
-  sendLog("📶 AP IP address: " + apIP.toString());
-  applyLocalTimezone(); // keep timestamps correct in AP mode
+  // AP fallback
+  sendLog("WiFi failed - AP fallback");
+  apFallbackActive = true; apFallbackTime = millis();
+  WiFi.disconnect(true, true); delay(200);
+  WiFi.mode(WIFI_OFF); delay(500);
+  WiFi.mode(WIFI_AP); delay(200);
+  WiFi.softAP("DewHeaterSetup"); delay(500);
+  IPAddress ip = WiFi.softAPIP();
+  sendLog("AP: 'DewHeaterSetup' -> " + ip.toString());
+  applyLocalTimezone();
   setupWebServer();
 }
 
+// ==========================================================================
+//  NTP
+// ==========================================================================
 
 void setupNTP() {
-  applyLocalTimezone(); // Ensure local time context before logging
-  sendLog("🕓 Initializing NTP...");
-
-  if (timezoneRule.isEmpty()) {
-    timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
-    sendLog("⚙️ No timezone rule found — defaulting to Australia/Sydney");
-  }
-
-  // Step 1 — configure NTP (sets up SNTP client)
+  applyLocalTimezone();
+  sendLog("Initialising NTP...");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  sendLog("🌐 NTP client configured with timezone rule: " + timezoneRule);
+  setenv("TZ", timezoneRule.c_str(), 1); tzset();
+  struct tm ti;
+  if (getLocalTime(&ti, 5000)) {
+    char buf[64]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+    sendLog("NTP synced: " + String(buf));
+    if (!logPruned) { logPruned = true; pruneThermalLog(ti); }
+  } else sendLog("NTP not yet synced");
+}
 
-  // Step 2 — immediately apply the timezone AFTER NTP setup
-  setenv("TZ", timezoneRule.c_str(), 1);
-  tzset();
-
-  // Step 3 — now safely call getLocalTime()
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 5000)) {
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
-    sendLog(String("✅ NTP time synchronized: ") + buf);
-    if (!logPruned) {
-      logPruned = true;
-      pruneThermalLog(timeinfo);
-    }
+void handleNTP(bool forceCheck) {
+  static bool synced = false;
+  if (!forceCheck && synced) return;
+  struct tm ti;
+  if (getLocalTime(&ti)) {
+    char buf[64]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+    sendLog("NTP: " + String(buf));
+    synced = true;
+    if (!logPruned) { logPruned = true; pruneThermalLog(ti); }
   } else {
-    sendLog("⚠️ NTP not yet synchronized (will retry automatically)");
+    sendLog("NTP retry...");
+    setenv("TZ", timezoneRule.c_str(), 1); tzset();
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   }
 }
 
+// ==========================================================================
+//  WEB SERVER
+// ==========================================================================
+
 void setupWebServer() {
-  // Guard against repeated route registration on WiFi reconnect
-  if (webServerInitialized) {
-    server.begin();
-    sendLog("🌐 Web server restarted (routes already registered)");
-    return;
-  }
+  if (webServerInitialized) { server.begin(); sendLog("Web server restarted"); return; }
   webServerInitialized = true;
 
+  // -- Root page -----------------------------------------------------------
   server.on("/", []() {
     String html = R"rawliteral(
-      <html><head><meta charset="utf-8"><title>Dew Heater</title>
-      <style>
-        html, body {
-          margin: 0; padding: 0; height: 100%;
-          font-family: sans-serif; box-sizing: border-box;
-          display: flex; flex-direction: column;
-        }
-        #main { display: flex; padding: 10px; flex-direction: row; align-items: flex-start; gap: 20px; justify-content: flex-start; }
-        #status, #settings { flex: 0 0 auto; }
-        @media (max-width: 600px) {
-          #main { flex-direction: column; }
-          #status, #settings { width: 100%; }
-        }
-        #log {
-          flex-grow: 1; overflow-y: auto;
-          border-top: 1px solid #ccc; background: #f8f8f8;
-          padding: 10px; white-space: pre-wrap;
-          box-sizing: border-box; max-height: calc(100vh - 240px);
-          min-height: 100px; font-family: monospace; font-size: 0.9rem;
-        }
-        #controls { display: flex; flex-direction: column; gap: 10px; padding: 10px; }
-        .inputrow { display: flex; align-items: center; margin: 5px 0; }
-        .inputrow label { width: 210px; }
-        .inputrow input { flex: 1; }
-        #dataModal {
-          display: none; position: fixed; top: 0; left: 0;
-          width: 100%; height: 100%; background: rgba(0,0,0,0.5);
-          z-index: 1000; justify-content: center; align-items: center;
-        }
-        #dataModal.active { display: flex; }
-        #dataModalBox {
-          background: white; border-radius: 8px; padding: 20px;
-          width: 80%; max-width: 800px; max-height: 80vh;
-          display: flex; flex-direction: column; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }
-        #dataModalHeader {
-          display: flex; justify-content: space-between; align-items: center;
-          margin-bottom: 10px;
-        }
-        #dataModalHeader h3 { margin: 0; }
-        #dataModalClose {
-          background: none; border: none; font-size: 1.5rem; cursor: pointer;
-          color: #666; padding: 0 4px; line-height: 1;
-        }
-        #dataModalClose:hover { color: #000; }
-        #dataModalContent {
-          flex: 1; overflow-y: auto; white-space: pre-wrap;
-          font-family: monospace; font-size: 0.85rem; background: #f8f8f8;
-          border: 1px solid #ccc; padding: 10px; border-radius: 4px;
-          user-select: text;
-        }
-        #dataModalButtons { display: flex; gap: 10px; margin-top: 10px; }
-        #dataModalButtons button { padding: 6px 16px; cursor: pointer; }
-      </style>
+<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Dew Heater Controller</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --amber: #d29922; --red: #f85149;
+    --preheat-col: #d29922; --active-col: #58a6ff; --sat-col: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Courier New', monospace; font-size: 14px; }
+  h1 { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 1rem; letter-spacing: 2px; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; }
+  h1 span.ver { font-size: 0.7rem; color: var(--muted); }
+  #wifi-badge { font-size: 0.75rem; padding: 3px 10px; border-radius: 12px; background: #f8514933; color: var(--red); }
+  #wifi-badge.ok { background: #3fb95033; color: var(--green); }
 
-      <script>
-        let logPaused = false;
+  #layout { display: flex; gap: 0; flex-wrap: wrap; }
+  #left { flex: 0 0 220px; border-right: 1px solid var(--border); }
+  #right { flex: 1 1 300px; display: flex; flex-direction: column; }
 
-        function updateStatus() {
-          // Add 3 second timeout for faster disconnect detection
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 3000);
-          
-          fetch('/status.json', { signal: controller.signal })
-            .then(r => r.json())
-            .then(data => {
-              clearTimeout(timeoutId);
-              // Update WiFi status - connected with signal strength and color coding
-            const wifiStatus = document.getElementById("wifiStatus");
-            const signal = parseInt(data.wifiSignal) || 0;
-            
-            let quality = "";
-            let bgColor = "";
-            
-            if (signal >= -50) {
-              quality = "Excellent";
-              bgColor = "#ccffcc";
-            } else if (signal >= -60) {
-              quality = "Good";
-              bgColor = "#ccffcc";
-            } else if (signal >= -70) {
-              quality = "Fair";
-              bgColor = "#ffcc99";
-            } else if (signal >= -80) {
-              quality = "Weak";
-              bgColor = "#ffcc99";
-            } else {
-              quality = "Very Weak";
-              bgColor = "#ffcccc";
-            }
-            
-            const signalStr = data.wifiSignal ? ` ${quality} (${data.wifiSignal}dBm)` : "";
-            wifiStatus.innerText = `📶 Connected${signalStr}`;
-            wifiStatus.style.backgroundColor = bgColor;
-            wifiStatus.style.color = "#333";
+  /* -- Status panel -- */
+  .stat-grid { padding: 12px 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-bottom: 1px solid var(--border); }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .stat .lbl { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .stat .val { font-size: 1.1rem; font-weight: bold; margin-top: 2px; }
+  .stat.wide { grid-column: span 2; }
+  .stat.phase-off      .val { color: var(--muted); }
+  .stat.phase-preheat  .val { color: var(--preheat-col); }
+  .stat.phase-active   .val { color: var(--active-col); }
+  .stat.phase-saturated .val { color: var(--red); }
 
-            document.getElementById("ambient").innerText = data.ambient;
-            document.getElementById("humidity").innerText = data.humidity;
-            document.getElementById("glass").innerText = data.glass;
-            document.getElementById("delta").innerText = data.delta;
-            document.getElementById("dewpoint").innerText  = data.dewpoint;
-            document.getElementById("dewspread").innerText = data.dewspread;
+  /* -- Phase bar -- */
+  #phasebar { margin: 0 16px 12px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  #phasefill { height: 100%; width: 0%; border-radius: 3px; transition: width 1s, background 1s; background: var(--muted); }
 
-            const heaterOn = data.heater;
-            const heaterSpan = document.getElementById("heater");
-            const heaterRow = document.getElementById("heaterRow");
-            heaterSpan.innerText = heaterOn ? "ON" : "OFF";
-            heaterRow.style.backgroundColor = heaterOn ? "#c0ffc0" : "transparent";
+  /* -- Settings -- */
+  #settings { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  #settings h2 { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 10px; }
+  .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .row label { flex: 0 0 160px; color: var(--muted); font-size: 0.8rem; }
+  .row input[type=text], .row input[type=password] { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 0.85rem; }
+  .powertable input.num { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 0.85rem; width: 100%; min-width: 0; text-align: right; }
+  .row input[type=text]:focus, .row input[type=password]:focus, .powertable input.num:focus { outline: none; border-color: #9aa4af; background: #2a3037; }
+  .row input.num { flex: 0 0 82px; width: 82px; text-align: right; }
+  .row .hint { min-width: 128px; text-align: right; color: var(--muted); font-size: 0.78rem; }
+  .powertable { margin: 10px 0 12px; border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; }
+  .powertable table { width: auto; min-width: 208px; margin: 0 auto; border-collapse: collapse; table-layout: fixed; }
+  .powertable col.col-spread { width: 72px; }
+  .powertable col.col-power  { width: 72px; }
+  .powertable col.col-watts  { width: 64px; }
+  .powertable th, .powertable td { padding: 5px 6px; border-bottom: 1px solid var(--border); font-size: 0.78rem; white-space: nowrap; }
+  .powertable tr:last-child td { border-bottom: none; }
+  .powertable th { color: var(--muted); text-align: right; background: #0f141c; }
+  .powertable th:nth-child(1), .powertable td:nth-child(1) { text-align: right; }
+  .powertable th:nth-child(2), .powertable td:nth-child(2) { text-align: right; }
+  .powertable th:nth-child(3), .powertable td:nth-child(3) { text-align: right; }
 
-            const pwmVal = parseInt(data.pwm);
-            const pwmSpan = document.getElementById("pwm");
-            const pwmRow = document.getElementById("pwmRow");
-            pwmSpan.innerText = pwmVal;
-            pwmRow.style.backgroundColor = pwmVal > 0 ? "#c0ffc0" : "transparent";
+  /* -- Buttons -- */
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  button { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 4px; font-family: inherit; font-size: 0.8rem; cursor: pointer; transition: border-color .15s, color .15s; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.active { border-color: var(--green); color: var(--green); }
+  button.danger { border-color: var(--red); color: var(--red); }
+  #saveBtn { border-color: var(--accent); color: var(--accent); }
+  #saveBtn.saved { border-color: var(--green); color: var(--green); }
+  #saveBtn:disabled { opacity: 0.85; cursor: default; }
 
-            document.getElementById("calibrationFileSize").innerText = data.calibrationFileSize;
-            document.getElementById("storageInfo").innerText = data.storageInfo;
-            document.getElementById("version").innerText = " " + data.version;
+  /* PWM test row */
+  #pwm-row { display: flex; align-items: center; gap: 10px; padding: 8px 16px; border-bottom: 1px solid var(--border); }
+  #pwm-row label { color: var(--muted); font-size: 0.8rem; }
+  #pwmTest { flex: 1; accent-color: var(--red); }
+  #pwmVal { min-width: 36px; color: var(--red); font-weight: bold; }
 
-            const calButton = document.getElementById("calButton");
-            if (data.calibrating) { calButton.innerText = "Stop Calibration"; }
-            else { calButton.innerText = "Start Calibration"; }
+  /* -- Log -- */
+  #log-header { display: flex; justify-content: space-between; align-items: center; padding: 6px 16px; border-bottom: 1px solid var(--border); }
+  #log-header span { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  #log { flex: 1; overflow-y: auto; background: var(--bg); padding: 10px 16px; white-space: pre-wrap; font-size: 0.8rem; line-height: 1.5; color: #8b949e; min-height: 200px; max-height: calc(100vh - 420px); }
+  #log .ts { color: #3d4450; }
 
-            const heaterButton = document.getElementById("heaterButton");
-            if (heaterOn) { heaterButton.innerText = "Turn Heater OFF"; }
-            else { heaterButton.innerText = "Turn Heater ON"; }
-          }).catch(error => {
-            // Update WiFi status - disconnected
-            const wifiStatus = document.getElementById("wifiStatus");
-            wifiStatus.innerText = "📶 Disconnected";
-            wifiStatus.style.backgroundColor = "#ffcccc";
-            wifiStatus.style.color = "#666";
-            console.log('Status update failed:', error);
-          });
-        }
+  /* -- Modal -- */
+  .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 999; justify-content: center; align-items: center; }
+  .modal.open { display: flex; }
+  .modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; width: 85%; max-width: 860px; max-height: 80vh; display: flex; flex-direction: column; }
+  .modal-box h3 { font-size: 0.9rem; margin-bottom: 12px; color: var(--accent); }
+  .modal-content { flex: 1; overflow-y: auto; white-space: pre-wrap; font-size: 0.78rem; line-height: 1.5; background: var(--bg); border: 1px solid var(--border); padding: 10px; border-radius: 4px; color: var(--muted); }
+  .modal-btns { display: flex; gap: 8px; margin-top: 12px; }
 
-        function toggleHeater() {
-          fetch("/toggle", { method: "POST" })
-            .then(() => {
-              const btn = document.getElementById("heaterButton");
-              if (btn.innerText === "Turn Heater ON") btn.innerText = "Turn Heater OFF";
-              else btn.innerText = "Turn Heater ON";
-              setTimeout(updateLog, 300);
-            });
-        }
+  @media (max-width: 600px) { #left { flex: 1 1 100%; border-right: none; border-bottom: 1px solid var(--border); } }
+</style>
+</head><body>
 
-        function updateLog() {
-          fetch('/log?full=1').then(r => r.text()).then(data => {
-            const box = document.getElementById("log");
-            box.innerText = data;
-            box.scrollTop = box.scrollHeight;
-          });
-        }
+<h1>
+  Dew Heater Controller
+  <span class="ver" id="ver"></span>
+  <span id="wifi-badge">Disconnected</span>
+</h1>
 
-        function updatePWMValue(val) {
-          document.getElementById("pwmValue").innerText = val + "%";
-        }
-
-        function sendPWMValue() {
-          const val = document.getElementById("pwmTest").value;
-          const btn = document.getElementById("pwmButton");
-
-          fetch("/pwmtest", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: "pwm=" + val
-          }).then(() => {
-            if (btn.innerText === "Apply") btn.innerText = "Stop";
-            else btn.innerText = "Apply";
-            console.log("PWM test value sent: " + val);
-            setTimeout(updateLog, 300);
-          });
-        }
-
-        function clearLog() {
-          fetch("/clearlog", { method: "POST" })
-            .then(() => {
-              document.getElementById("log").innerText = "🧹 Clearing log.";
-            });
-        }
-
-        function showCalibration() {
-          fetch('/downloadcal').then(r => {
-            if (r.ok) return r.text();
-            throw new Error('No data');
-          }).then(text => showDataModal('Calibration Data', text))
-            .catch(() => showDataModal('Calibration Data', 'No calibration data found.'));
-        }
-
-        function toggleCalibration() {
-         fetch("/calibrate", { method: "POST" })
-            .then(() => {
-              const btn = document.getElementById("calButton");
-              if (btn.innerText === "Start Calibration") btn.innerText = "Stop Calibration";
-              else btn.innerText = "Start Calibration";
-              setTimeout(updateLog, 300);
-            });
-        }
-
-        function clearCalibration() {
-          fetch("/clearcal", { method: "POST" })
-            .then(() => {
-              document.getElementById("log").innerText = "🧹 Clearing calibration data.";
-              setTimeout(updateLog, 300);
-            });
-        }
-
-        function clearThermalLog() {
-          fetch("/clearlog_thermal", { method: "POST" })
-            .then(() => {
-              document.getElementById("log").innerText = "🧹 Clearing thermal log.";
-              setTimeout(updateLog, 300);
-            });
-        }
-
-        function showThermalLog() {
-          fetch('/downloadlog').then(r => {
-            if (r.ok) return r.text();
-            throw new Error('No data');
-          }).then(text => showDataModal('Thermal Log', text))
-            .catch(() => showDataModal('Thermal Log', 'No thermal log found.'));
-        }
-
-        function showDataModal(title, content) {
-          document.getElementById('dataModalTitle').innerText = title;
-          document.getElementById('dataModalContent').innerText = content;
-          document.getElementById('dataModal').classList.add('active');
-          const el = document.getElementById('dataModalContent');
-          setTimeout(() => { el.scrollTop = el.scrollHeight; }, 50);
-        }
-
-        function closeDataModal() {
-          document.getElementById('dataModal').classList.remove('active');
-        }
-
-        function copyModalData() {
-          const text = document.getElementById('dataModalContent').innerText;
-          const btn = document.getElementById('copyBtn');
-          const ta = document.createElement('textarea');
-          ta.value = text;
-          ta.style.position = 'fixed';
-          ta.style.opacity = '0';
-          document.body.appendChild(ta);
-          ta.select();
-          document.execCommand('copy');
-          document.body.removeChild(ta);
-          btn.innerText = 'Copied!';
-          setTimeout(() => btn.innerText = 'Copy to Clipboard', 1500);
-        }
-
-        function toggleLogPause() {
-          logPaused = !logPaused;
-          const btn = document.getElementById("pauseLogButton");
-          btn.innerText = logPaused ? "Resume Log" : "Pause Log";
-        }
-
-        function downloadCalibration() {
-          window.location.href = "/downloadcal";
-        }
-
-        setInterval(() => { 
-          updateStatus();
-          if (!logPaused) updateLog();
-        }, )rawliteral" + String(WIFI_STATUS_CHECK_INTERVAL_MS) + R"rawliteral();
-
-        window.onload = () => { updateStatus(); updateLog(); };
-
-      </script>
-      </head><body>
-      <h2 style="padding:10px">
-        Dew Heater Controller 
-        <span id="version" style="font-size: 0.6em; color: #666;"></span>
-        <span id="wifiStatus" style="float: right; font-size: 0.8em; padding: 5px 10px; border-radius: 4px; background-color: #ffcccc; color: #666;">📶 Disconnected</span>
-      </h2>
-      <div id="main">
-        <div id="status">
-          <table style="font-family: monospace; font-size: 1rem;">
-            <tr><td>🌡 Ambient:</td>       <td><span id='ambient'>--</span> °C</td></tr>
-            <tr><td>💧 Humidity:</td>      <td><span id='humidity'>--</span> %</td></tr>
-            <tr><td>🧮 Dew Point:</td>     <td><span id='dewpoint'>--</span> °C</td></tr>
-            <tr><td>📉 Dew Spread:</td>    <td><span id='dewspread'>--</span> °C</td></tr>
-            <tr><td>🔍 Glass:</td>         <td><span id='glass'>--</span> °C</td></tr>
-            <tr><td>📏 Delta (Tg - Td):</td><td><span id='delta'>--</span> °C</td></tr>
-            <tr id="heaterRow"><td>🔌 Heater:</td> <td><span id='heater'>--</span></td></tr>
-            <tr id="pwmRow"><td>🔥 Heating Power:</td> <td><span id='pwm'>--</span>%</td></tr>
-            <tr><td>🗂 Calibration File:</td> <td><span id='calibrationFileSize'>--</span></td></tr>
-            <tr><td>💾 Storage Used:</td> <td><span id='storageInfo'>--</span></td></tr>
-          </table>
-        </div>
-
-        <div id="settings">
-          <form action="/settings" method="POST">
-            <div class="inputrow">
-              <label>Margin above Dew Point (°C):</label>
-              <input name="delta" value=")rawliteral" + String(targetDelta, 1) + R"rawliteral(">
-            </div>
-            <div class="inputrow">
-              <label>Dew Spread (°C):</label>
-              <input name="dewspread" value=")rawliteral" + String(dewSpreadThreshold, 1) + R"rawliteral(">
-            </div>
-            <div class="inputrow">
-              <label>Dew Spread Hysteresis (°C):</label>
-              <input name="dewhyst" value=")rawliteral" + String(dewSpreadHysteresis, 1) + R"rawliteral(">
-            </div>
-            <div class="inputrow">
-              <label>SSID:</label>
-              <input name="ssid" value=")rawliteral" + wifiSSID + R"rawliteral(">
-            </div>
-            <div class="inputrow">
-              <label>Password:</label>
-              <input name="password" type="password" placeholder="(unchanged)">
-            </div>
-            <div class="inputrow">
-              <label>Timezone Rule:</label>
-              <input name="timezoneRule" value=")rawliteral" + timezoneRule + R"rawliteral(">
-            </div>
-            <button type="submit">Update Settings</button>
-          </form>
-            <p> T_glass = )rawliteral" 
-              + String(glassCoeffA, 1) + R"rawliteral(·V² + )rawliteral"
-              + String(glassCoeffB, 1) + R"rawliteral(·V + )rawliteral"
-              + String(glassCoeffC, 1) + R"rawliteral(</p>
-        </div>
+<div id="layout">
+  <!-- LEFT: status + settings -->
+  <div id="left">
+    <div class="stat-grid">
+      <div class="stat wide" id="powerBox">
+        <div class="lbl">Heater Output</div>
+        <div class="val" id="powerVal">-</div>
       </div>
+      <div class="stat"><div class="lbl">Ambient</div><div class="val"><span id="Ta">-</span> C</div></div>
+      <div class="stat"><div class="lbl">Humidity</div><div class="val"><span id="RH">-</span> %</div></div>
+      <div class="stat"><div class="lbl">Dew Point</div><div class="val"><span id="Td">-</span> C</div></div>
+      <div class="stat"><div class="lbl">Spread</div><div class="val"><span id="spread">-</span> C</div></div>
+      <div class="stat"><div class="lbl">Ring Temp</div><div class="val"><span id="ringTemp">-</span> C</div></div>
+      <div class="stat"><div class="lbl">Heater Power</div><div class="val"><span id="pwmPct">-</span> %</div></div>
+      <div class="stat wide"><div class="lbl">Storage</div><div class="val" style="font-size:.85rem" id="storage">-</div></div>
+    </div>
 
-      <div id="controls">
-        <!-- Row 1 -->
-        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-          <button id="heaterButton" type="button" onclick="toggleHeater()">Turn Heater ON</button>
-          <button id="calButton" type="button" onclick="toggleCalibration()">Start Calibration</button>
-          <button type="button" onclick="showCalibration()">Show Calibration</button>
-          <button type="button" onclick="clearLog()">Clear Log</button>
-          <button id="pauseLogButton" type="button" onclick="toggleLogPause()">Pause Log</button>
-          <button type="button" onclick="downloadCalibration()">Download Calibration CSV</button>
-          <button type="button" onclick="showThermalLog()">Show Thermal Log</button>
-        </div>
+    <div id="phasebar"><div id="phasefill"></div></div>
 
-        <!-- Row 2 -->
-        <div style="display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
-          <button type="button" onclick="clearCalibration()">Clear Calibration Data</button>
-          <button type="button" onclick="clearThermalLog()">Clear Thermal Log</button>
-          <div style="display: flex; align-items: center; gap: 10px;">
-            <label for="pwmTest">🧪 PWM Test:</label>
-            <input type="range" id="pwmTest" min="0" max="100" value="0" oninput="updatePWMValue(this.value)">
-            <span id="pwmValue">0%</span>
-            <button id="pwmButton" onclick="sendPWMValue()" type="button">Apply</button>
-          </div>
-        </div>
+    <div class="btn-row">
+      <button id="heaterBtn" onclick="toggleHeater()">Enable Heater</button>
+    </div>
+
+    <div id="pwm-row">
+      <label>PWM Test</label>
+      <input type="range" id="pwmTest" min="0" max="100" value="0" oninput="document.getElementById('pwmVal').innerText=this.value+'%'">
+      <span id="pwmVal">0%</span>
+      <button id="pwmBtn" onclick="sendPWM()">Apply</button>
+    </div>
+
+    <div id="settings">
+      <h2>Settings</h2>
+      <div class="row"><label>SSID</label><input type="text" id="ssid" name="ssid"></div>
+      <div class="row"><label>Password</label><input type="password" id="password" placeholder="(unchanged)"></div>
+      <div class="row"><label>Timezone Rule</label><input type="text" id="tz" name="tz"></div>
+      <div class="row"><label>Max Power (%)</label><input class="num" type="text" id="maxPwmPercent" name="maxPwmPercent"><span class="hint" id="maxPowerInfo">Max Power: 23W</span></div>
+      <div class="row"><label>Rise Hysteresis (C)</label><input class="num" type="text" id="spreadRiseHystC" name="spreadRiseHystC"></div>
+      <div class="row"><label>Ring Temp Cutoff (C)</label><input class="num" type="text" id="ringTempCutoff" name="ringTempCutoff"></div>
+
+      <div class="powertable">
+        <table>
+          <colgroup>
+            <col class="col-spread">
+            <col class="col-power">
+            <col class="col-watts">
+          </colgroup>
+          <thead><tr><th>Spread</th><th>Power %</th><th>Watts</th></tr></thead>
+          <tbody>
+            <tr><td><input class="num" type="text" id="s1" value="4.0"></td><td><input class="num" type="text" id="p1" value="15"></td><td id="w1">-</td></tr>
+            <tr><td><input class="num" type="text" id="s2" value="3.0"></td><td><input class="num" type="text" id="p2" value="25"></td><td id="w2">-</td></tr>
+            <tr><td><input class="num" type="text" id="s3" value="2.0"></td><td><input class="num" type="text" id="p3" value="40"></td><td id="w3">-</td></tr>
+            <tr><td><input class="num" type="text" id="s4" value="1.0"></td><td><input class="num" type="text" id="p4" value="65"></td><td id="w4">-</td></tr>
+            <tr><td><input class="num" type="text" id="s5" value="0.5"></td><td><input class="num" type="text" id="p5" value="75"></td><td id="w5">-</td></tr>
+            <tr><td><input class="num" type="text" id="s6" value="0.0"></td><td><input class="num" type="text" id="p6" value="85"></td><td id="w6">-</td></tr>
+          </tbody>
+        </table>
       </div>
-      <div id="log">Loading...</div>
-      <div id="dataModal">
-        <div id="dataModalBox">
-          <div id="dataModalHeader">
-            <h3 id="dataModalTitle"></h3>
-            <button id="dataModalClose" onclick="closeDataModal()">&times;</button>
-          </div>
-          <div id="dataModalContent"></div>
-          <div id="dataModalButtons">
-            <button id="copyBtn" onclick="copyModalData()">Copy to Clipboard</button>
-            <button onclick="closeDataModal()">Close</button>
-          </div>
-        </div>
+      <button id="saveBtn" onclick="saveSettings()">Save Settings</button>
+    </div>
+  </div>
+
+  <!-- RIGHT: log -->
+  <div id="right">
+    <div id="log-header">
+      <span>Event Log</span>
+      <div style="display:flex;gap:6px">
+        <button onclick="showThermalLog()">Thermal Log</button>
+        <button onclick="clearLog()">Clear</button>
+        <button id="pauseBtn" onclick="togglePause()">Pause</button>
       </div>
-      </body></html>
-    )rawliteral";
-    server.send(200, "text/html; charset=UTF-8", html);
+    </div>
+    <div id="log">Loading...</div>
+  </div>
+</div>
+
+<!-- Modal -->
+<div class="modal" id="modal">
+  <div class="modal-box">
+    <h3 id="modal-title"></h3>
+    <div class="modal-content" id="modal-content"></div>
+    <div class="modal-btns">
+      <button onclick="copyModal()">Copy</button>
+      <button onclick="closeModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  let logPaused = false;
+  let settingsDirty = false;
+  let latestMaxPowerW = 0;
+
+  function updateSaveButtonLabel() {
+    const btn = document.getElementById('saveBtn');
+    if (!btn || btn.dataset.saving === '1') return;
+    btn.innerText = settingsDirty ? 'Unsaved Settings' : 'Save Settings';
+  }
+
+  function recalcTableWatts() {
+    const maxPct = parseFloat((document.getElementById('maxPwmPercent') || {}).value) || 0;
+    const capW = latestMaxPowerW * (maxPct / 100);
+    const pctAt = (id) => parseFloat((document.getElementById(id) || {}).value) || 0;
+    const setW = (id, pct) => {
+      const el = document.getElementById(id);
+      if (el) el.innerText = (capW * (pct / 100)).toFixed(1) + 'W';
+    };
+    setW('w1', pctAt('p1'));
+    setW('w2', pctAt('p2'));
+    setW('w3', pctAt('p3'));
+    setW('w4', pctAt('p4'));
+    setW('w5', pctAt('p5'));
+    setW('w6', pctAt('p6'));
+  }
+
+  function watchSettingsChanges() {
+    document.querySelectorAll('#settings input').forEach(el => {
+      el.addEventListener('input', () => {
+        settingsDirty = true;
+        updateSaveButtonLabel();
+        recalcTableWatts();
+      });
+    });
+  }
+
+  function updateStatus() {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 3000);
+    fetch('/status.json', { signal: ctrl.signal })
+      .then(r => r.json()).then(d => {
+        document.getElementById('ver').innerText  = d.version || '';
+
+        // WiFi badge
+        const wb = document.getElementById('wifi-badge');
+        if (d.wifiSignal && d.wifiSignal > -200) {
+          wb.className = 'ok';
+          wb.innerText = d.wifiSignal + ' dBm';
+        } else {
+          wb.className = '';
+          wb.innerText = 'Disconnected';
+        }
+
+        document.getElementById('Ta').innerText     = d.ambient;
+        document.getElementById('RH').innerText     = d.humidity;
+        document.getElementById('Td').innerText     = d.dewpoint;
+        document.getElementById('spread').innerText = d.dewspread;
+        document.getElementById('ringTemp').innerText = d.ringTemp;
+        document.getElementById('pwmPct').innerText = d.pwm;
+        document.getElementById('storage').innerText = d.storageInfo;
+        document.getElementById('ver').innerText     = d.version;
+
+        // Heater output display (% of capped runtime power and watts)
+        const pb = document.getElementById('powerBox');
+        const pv = document.getElementById('powerVal');
+        const pf = document.getElementById('phasefill');
+        const pwmPctFull = parseFloat(d.pwm) || 0;              // % of full hardware power
+        const maxPct = parseFloat(d.maxPwmPercent) || 0;        // runtime cap % of full power
+        const maxW = parseFloat(d.maxPowerW) || 0;
+        const outW = maxW * (pwmPctFull / 100.0);
+        const manualPwmTest = !!d.pwmTest;
+        // In PWM Test mode, show direct hardware PWM %, not % of runtime cap.
+        const outPctRaw = manualPwmTest
+          ? pwmPctFull
+          : ((maxPct > 0.0) ? (pwmPctFull / maxPct) * 100.0 : 0.0);
+        const outPctShown = Math.min(100, Math.max(0, outPctRaw));
+        pv.innerText = outPctShown.toFixed(0) + '% / ' + outW.toFixed(1) + 'W';
+        pv.style.color = pwmPctFull > 0.0 ? 'var(--green)' : 'var(--muted)';
+        pb.className = 'stat wide';
+
+        // Output progress bar tracks % of capped runtime power.
+        pf.style.width = outPctShown.toFixed(1) + '%';
+        pf.style.background = outPctShown >= 90 ? 'var(--red)' : outPctShown >= 60 ? 'var(--amber)' : 'var(--accent)';
+
+        // Heater button
+        const hb = document.getElementById('heaterBtn');
+        hb.innerText  = d.heater ? 'Disable Heater' : 'Enable Heater';
+        hb.className  = d.heater ? 'active' : '';
+
+        // Keep settings live-synced unless user is actively working in Settings.
+        const settingsPanel = document.getElementById('settings');
+        const editingSettings = settingsPanel && settingsPanel.contains(document.activeElement);
+
+        if (!editingSettings) {
+        const setIfNotFocused = (id, value) => {
+          const el = document.getElementById(id);
+          if (document.activeElement !== el) {
+            el.value = (value === undefined || value === null) ? '' : String(value);
+          }
+        };
+        setIfNotFocused('ssid', d.ssid);
+        setIfNotFocused('tz', d.tz);
+        setIfNotFocused('maxPwmPercent', d.maxPwmPercent);
+        setIfNotFocused('spreadRiseHystC', d.spreadRiseHystC);
+        setIfNotFocused('ringTempCutoff', d.ringTempCutoff);
+        setIfNotFocused('p1', d.p1);
+        setIfNotFocused('s1', d.s1);
+        setIfNotFocused('s2', d.s2);
+        setIfNotFocused('s3', d.s3);
+        setIfNotFocused('s4', d.s4);
+        setIfNotFocused('s5', d.s5);
+        setIfNotFocused('s6', d.s6);
+        setIfNotFocused('p2', d.p2);
+        setIfNotFocused('p3', d.p3);
+        setIfNotFocused('p4', d.p4);
+        setIfNotFocused('p5', d.p5);
+        setIfNotFocused('p6', d.p6);
+        }
+
+        latestMaxPowerW = parseFloat(d.maxPowerW) || 0;
+        document.getElementById('maxPowerInfo').innerText = 'Max Power: ' + Math.round(latestMaxPowerW) + 'W';
+        recalcTableWatts();
+      }).catch(() => {
+        document.getElementById('wifi-badge').className = '';
+        document.getElementById('wifi-badge').innerText = 'Disconnected';
+      });
+  }
+
+  function updateLog() {
+    if (logPaused) return;
+    fetch('/log').then(r => r.text()).then(t => {
+      const box = document.getElementById('log');
+      box.innerText = t;
+      box.scrollTop = box.scrollHeight;
+    });
+  }
+
+  function toggleHeater() {
+    fetch('/toggle', { method: 'POST' }).then(() => setTimeout(updateStatus, 300));
+  }
+
+  function saveSettings() {
+    const btn = document.getElementById('saveBtn');
+    if (btn.dataset.saving === '1') return;
+
+    const defaultLabel = 'Save Settings';
+    btn.dataset.saving = '1';
+    btn.disabled = true;
+    btn.classList.remove('saved', 'danger');
+    btn.innerText = 'Saving...';
+
+    const body = new URLSearchParams({
+      ssid:       document.getElementById('ssid').value,
+      password:   document.getElementById('password').value,
+      tz:         document.getElementById('tz').value,
+      maxPwmPercent: document.getElementById('maxPwmPercent').value,
+      spreadRiseHystC: document.getElementById('spreadRiseHystC').value,
+      ringTempCutoff: document.getElementById('ringTempCutoff').value,
+      p1: document.getElementById('p1').value,
+      s1: document.getElementById('s1').value,
+      s2: document.getElementById('s2').value,
+      s3: document.getElementById('s3').value,
+      s4: document.getElementById('s4').value,
+      s5: document.getElementById('s5').value,
+      s6: document.getElementById('s6').value,
+      p2: document.getElementById('p2').value,
+      p3: document.getElementById('p3').value,
+      p4: document.getElementById('p4').value,
+      p5: document.getElementById('p5').value,
+      p6: document.getElementById('p6').value
+    });
+    fetch('/settings', { method: 'POST', body })
+      .then(r => {
+        if (!r.ok) throw new Error('save failed');
+        settingsDirty = false;
+        btn.classList.add('saved');
+        btn.innerText = 'Saved';
+        setTimeout(updateStatus, 400);
+      })
+      .catch(() => {
+        settingsDirty = true;
+        btn.classList.add('danger');
+        btn.innerText = 'Save Failed';
+      })
+      .finally(() => {
+        setTimeout(() => {
+          btn.classList.remove('saved', 'danger');
+          btn.disabled = false;
+          btn.dataset.saving = '0';
+          btn.innerText = defaultLabel;
+          updateSaveButtonLabel();
+        }, 1200);
+      });
+  }
+
+  function sendPWM() {
+    const val = document.getElementById('pwmTest').value;
+    const btn = document.getElementById('pwmBtn');
+    fetch('/pwmtest', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: 'pwm=' + val })
+      .then(() => { btn.innerText = btn.innerText === 'Apply' ? 'Stop' : 'Apply'; });
+  }
+
+  function clearLog() {
+    fetch('/clearlog', { method: 'POST' }).then(() => document.getElementById('log').innerText = '');
+  }
+
+  function togglePause() {
+    logPaused = !logPaused;
+    document.getElementById('pauseBtn').innerText = logPaused ? 'Resume' : 'Pause';
+  }
+
+  function showThermalLog() {
+    fetch('/downloadlog').then(r => r.ok ? r.text() : Promise.reject())
+      .then(t => showModal('Thermal Log', t))
+      .catch(() => showModal('Thermal Log', 'No thermal log found.'));
+  }
+
+  function showModal(title, content) {
+    document.getElementById('modal-title').innerText   = title;
+    document.getElementById('modal-content').innerText = content;
+    document.getElementById('modal').classList.add('open');
+    setTimeout(() => {
+      const el = document.getElementById('modal-content');
+      el.scrollTop = el.scrollHeight;
+    }, 50);
+  }
+
+  function closeModal() { document.getElementById('modal').classList.remove('open'); }
+
+  function copyModal() {
+    navigator.clipboard.writeText(document.getElementById('modal-content').innerText)
+      .catch(() => {
+        const ta = document.createElement('textarea');
+        ta.value = document.getElementById('modal-content').innerText;
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      });
+  }
+
+  setInterval(() => { updateStatus(); updateLog(); }, )rawliteral"
+    + String(WIFI_STATUS_CHECK_INTERVAL_MS) +
+    R"rawliteral();
+  window.onload = () => { watchSettingsChanges(); updateSaveButtonLabel(); updateStatus(); updateLog(); };
+</script>
+</body></html>
+)rawliteral";
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.send(200, "text/html; charset=UTF-8", html);
   });
 
-  // ---- JSON/status and control endpoints ----
-
+  // -- /status.json --------------------------------------------------------
   server.on("/status.json", []() {
-    // Get cached values updated by background task
-    float cached_td_local, cached_spread_local;
-    String cached_calFileSize_local, cached_storageInfo_local;
-    int cached_rssi_local;
-    
+    float t, h, ring;
+    float td_l, spread_l;
+    int   rssi_l;
+    String storage_l;
+
+    readSensorValues(t, h);
+    ring = readRingTemp();
+
     if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(5))) {
-      cached_td_local = cached_td;
-      cached_spread_local = cached_spread;
-      cached_calFileSize_local = cached_calFileSize;
-      cached_storageInfo_local = cached_storageInfo;
-      cached_rssi_local = cached_rssi;
+      td_l      = cached_td;
+      spread_l  = cached_spread;
+      rssi_l    = cached_rssi;
+      storage_l = cached_storageInfo;
       xSemaphoreGive(cacheMutex);
     } else {
-      // Fallback values if mutex fails
-      cached_td_local = NAN;
-      cached_spread_local = NAN;
-      cached_calFileSize_local = "0 KB";
-      cached_storageInfo_local = "0/0 KB";
-      cached_rssi_local = -99;
+      td_l = spread_l = NAN; rssi_l = -99; storage_l = "0/0 KB";
     }
 
-    // Fast path - just get current values
-    float t, h;
-    readSensorValues(t, h);
+    int pwmPct = (int)lroundf(((float)pwm * 100.0f) / 255.0f);
 
-    float delta = glassTemp - cached_td_local;  // Tg - Td (glass temp above dew point)
-    int pwmPercent = pwm * 100 / 255;
-    String statusTime = getStatusTimeString();
-
-    // Simplified JSON response - avoid heavy String operations
     String json = "{";
-    json += "\"ambient\":\"" + String(t, 1) + "\",";
-    json += "\"humidity\":\"" + String(h, 1) + "\",";
-    json += "\"dewpoint\":\"" + (isnan(cached_td_local) ? "NaN" : String(cached_td_local, 1)) + "\",";
-    json += "\"dewspread\":\"" + (isnan(cached_spread_local) ? "NaN" : String(cached_spread_local, 1)) + "\",";
-    json += "\"glass\":\"" + String(glassTemp, 1) + "\",";
-    json += "\"delta\":\"" + String(delta, 1) + "\",";
-    json += "\"heater\":" + String(heaterEnabled ? "true" : "false") + ",";
-    json += "\"pwm\":" + String(pwmPercent) + ",";
-    json += "\"calibrating\":" + String(calibrating ? "true" : "false") + ",";
-    json += "\"calibrationFileSize\":\"" + cached_calFileSize_local + "\",";
-    json += "\"storageInfo\":\"" + cached_storageInfo_local + "\",";
-    json += "\"version\":\"" + String(DEVICE_VERSION) + "\",";
-    json += "\"dewSpreadThreshold\":\"" + String(dewSpreadThreshold, 1) + "\",";
-    json += "\"dewSpreadHysteresis\":\"" + String(dewSpreadHysteresis, 1) + "\",";
-    json += "\"time\":\"" + statusTime + "\",";
-    json += "\"wifiSignal\":" + String(cached_rssi_local);
+    json += "\"ambient\":\""     + String(t, 1)                                     + "\",";
+    json += "\"humidity\":\""    + String(h, 1)                                     + "\",";
+    json += "\"dewpoint\":\""    + (isnan(td_l)     ? "NaN" : String(td_l, 1))     + "\",";
+    json += "\"dewspread\":\""   + (isnan(spread_l) ? "NaN" : String(spread_l, 1)) + "\",";
+    json += "\"ringTemp\":\""    + (isnan(ring)      ? "NaN" : String(ring, 1))     + "\",";
+    json += "\"heater\":"        + String(heaterEnabled ? "true" : "false")         + ",";
+    json += "\"pwm\":"           + String(pwmPct)                                   + ",";
+    json += "\"pwmTest\":"       + String(pwmTest ? "true" : "false")              + ",";
+    json += "\"phase\":\""       + phaseLabel()                                     + "\",";
+    json += "\"maxPwmPercent\":\"" + String(maxPwmPercent)                           + "\",";
+    json += "\"spreadRiseHystC\":\"" + String(spreadRiseHystC, 2)                    + "\",";
+    json += "\"maxPowerW\":\"" + String(heaterMaxPowerW(), 1)                         + "\",";
+    json += "\"ringTempCutoff\":\"" + String(ringTempCutoff, 1)                     + "\",";
+    json += "\"s1\":\"" + String(spreadPointC[0], 2)                                 + "\",";
+    json += "\"p1\":\"" + String(spreadPowerPct[0])                                   + "\",";
+    json += "\"s2\":\"" + String(spreadPointC[1], 2)                                 + "\",";
+    json += "\"p2\":\"" + String(spreadPowerPct[1])                                   + "\",";
+    json += "\"s3\":\"" + String(spreadPointC[2], 2)                                 + "\",";
+    json += "\"p3\":\"" + String(spreadPowerPct[2])                                   + "\",";
+    json += "\"s4\":\"" + String(spreadPointC[3], 2)                                 + "\",";
+    json += "\"p4\":\"" + String(spreadPowerPct[3])                                   + "\",";
+    json += "\"s5\":\"" + String(spreadPointC[4], 2)                                 + "\",";
+    json += "\"p5\":\"" + String(spreadPowerPct[4])                                   + "\",";
+    json += "\"s6\":\"" + String(spreadPointC[5], 2)                                 + "\",";
+    json += "\"p6\":\"" + String(spreadPowerPct[5])                                   + "\",";
+    json += "\"ssid\":\""        + wifiSSID                                         + "\",";
+    json += "\"tz\":\""          + timezoneRule                                     + "\",";
+    json += "\"storageInfo\":\"" + storage_l                                        + "\",";
+    json += "\"version\":\""     + String(DEVICE_VERSION)                           + "\",";
+    json += "\"time\":\""        + getStatusTimeString()                            + "\",";
+    json += "\"wifiSignal\":"    + String(rssi_l);
     json += "}";
-    
+
     server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    server.sendHeader("Pragma", "no-cache");
-    server.sendHeader("Expires", "0");
     server.send(200, "application/json; charset=UTF-8", json);
   });
 
+  // -- /log ----------------------------------------------------------------
   server.on("/log", []() {
-    if (server.hasArg("full")) {
-      // Full log requested explicitly
-      server.send(200, "text/plain", logBuffer);
-    } else {
-      // Send only recent log entries to reduce network load
-      String recentLog = "";
-      int bufferLen = logBuffer.length();
-      
-      if (bufferLen > 3072) {  // 3KB threshold
-        // Find the last 2KB but ensure we start at a complete line
-        int startPos = bufferLen - 2048;
-        
-        // Yield during string processing to allow system message pump
-        yield();
-        
-        // Find the next newline to avoid cutting lines in half
-        int nextNewline = logBuffer.indexOf('\n', startPos);
-        if (nextNewline != -1 && nextNewline < bufferLen - 1) {
-          startPos = nextNewline + 1;  // Start after the newline
-        }
-        
-        yield(); // Yield before substring operation
-        recentLog = logBuffer.substring(startPos);
-      } else {
-        // Buffer is small enough, send it all
-        recentLog = logBuffer;
-      }
-      
-      server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-      server.sendHeader("Pragma", "no-cache");
-      server.sendHeader("Expires", "0");
-      server.send(200, "text/plain", recentLog);
-    }
+    String out;
+    int len = logBuffer.length();
+    if (len > 3072) {
+      int start = logBuffer.indexOf('\n', len - 2048);
+      out = (start != -1) ? logBuffer.substring(start + 1) : logBuffer;
+    } else out = logBuffer;
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.send(200, "text/plain", out);
   });
 
+  // -- Control endpoints ----------------------------------------------------
   server.on("/toggle", HTTP_POST, []() {
     heaterEnabled = !heaterEnabled;
-    if (heaterEnabled) sendLog("🔌 Heater ENABLED");
-    else sendLog("🛑 Heater DISABLED");
+    sendLog(heaterEnabled ? "Heater ENABLED" : "Heater DISABLED");
     saveConfig();
-    server.send(200);
-  });
-
-  server.on("/calibrate", HTTP_POST, []() {
-    calibrating = !calibrating;
-    calCount = 0;
-    calResetRequested = true;  // signal updateCalibration() to reset its statics
-
-    if (calibrating) sendLog("🧪 Calibration STARTED — sampling every 30 sec: [time, ambient, V, PWM %]");
-    else sendLog("✅ Calibration STOPPED");
     server.send(200);
   });
 
   server.on("/settings", HTTP_POST, []() {
     bool wifiChanged = false;
-    String oldSSID = wifiSSID;
-    String oldPass = wifiPass;
-    
-    if (server.hasArg("delta"))        targetDelta      = server.arg("delta").toFloat();
-    if (server.hasArg("dewspread"))    dewSpreadThreshold = server.arg("dewspread").toFloat();
-    if (server.hasArg("dewhyst"))      dewSpreadHysteresis = server.arg("dewhyst").toFloat();
-    if (server.hasArg("ssid"))         wifiSSID         = server.arg("ssid");
-    // Only update password if user actually typed a new one
-    if (server.hasArg("password") && server.arg("password").length() > 0) {
+    String oldSSID = wifiSSID, oldPass = wifiPass;
+
+    if (server.hasArg("maxPwmPercent")) {
+      maxPwmPercent = constrain(server.arg("maxPwmPercent").toInt(), 10, 100);
+    }
+    if (server.hasArg("spreadRiseHystC")) {
+      spreadRiseHystC = constrain(server.arg("spreadRiseHystC").toFloat(), 0.0f, 3.0f);
+    }
+    if (server.hasArg("ringTempCutoff")) {
+      ringTempCutoff = constrain(server.arg("ringTempCutoff").toFloat(), 20.0f, 90.0f);
+    }
+    if (server.hasArg("ssid"))     wifiSSID     = server.arg("ssid");
+    if (server.hasArg("password") && server.arg("password").length() > 0)
       wifiPass = server.arg("password");
-    }
-    if (server.hasArg("timezoneRule")) timezoneRule     = server.arg("timezoneRule");
+    if (server.hasArg("tz"))       timezoneRule = server.arg("tz");
+    if (server.hasArg("s1")) spreadPointC[0] = constrain(server.arg("s1").toFloat(), 0.0f, 20.0f);
+    if (server.hasArg("s2")) spreadPointC[1] = constrain(server.arg("s2").toFloat(), 0.0f, 20.0f);
+    if (server.hasArg("s3")) spreadPointC[2] = constrain(server.arg("s3").toFloat(), 0.0f, 20.0f);
+    if (server.hasArg("s4")) spreadPointC[3] = constrain(server.arg("s4").toFloat(), 0.0f, 20.0f);
+    if (server.hasArg("s5")) spreadPointC[4] = constrain(server.arg("s5").toFloat(), 0.0f, 20.0f);
+    if (server.hasArg("s6")) spreadPointC[5] = constrain(server.arg("s6").toFloat(), 0.0f, 20.0f);
+    if (server.hasArg("p1")) spreadPowerPct[0] = constrain(server.arg("p1").toInt(), 0, 100);
+    if (server.hasArg("p2")) spreadPowerPct[1] = constrain(server.arg("p2").toInt(), 0, 100);
+    if (server.hasArg("p3")) spreadPowerPct[2] = constrain(server.arg("p3").toInt(), 0, 100);
+    if (server.hasArg("p4")) spreadPowerPct[3] = constrain(server.arg("p4").toInt(), 0, 100);
+    if (server.hasArg("p5")) spreadPowerPct[4] = constrain(server.arg("p5").toInt(), 0, 100);
+    if (server.hasArg("p6")) spreadPowerPct[5] = constrain(server.arg("p6").toInt(), 0, 100);
+    sanitizeSpreadTable();
 
-    // Check if WiFi credentials changed
-    if (oldSSID != wifiSSID || oldPass != wifiPass) {
-      wifiChanged = true;
-    }
+    if (oldSSID != wifiSSID || oldPass != wifiPass) wifiChanged = true;
 
-    sendLog("⚙️ Settings updated");
+        sendLog("Settings saved - maxPower=" + String(maxPwmPercent) + "%" +
+          ", riseHyst=" + String(spreadRiseHystC, 2) + "C" +
+          ", ringCutoff=" + String(ringTempCutoff, 1) + "C" +
+          ", table=[" + String(spreadPointC[0], 2) + "->" + String(spreadPowerPct[0]) + "%"
+          + "," + String(spreadPointC[1], 2) + "->" + String(spreadPowerPct[1]) + "%"
+          + "," + String(spreadPointC[2], 2) + "->" + String(spreadPowerPct[2]) + "%"
+          + "," + String(spreadPointC[3], 2) + "->" + String(spreadPowerPct[3]) + "%"
+          + "," + String(spreadPointC[4], 2) + "->" + String(spreadPowerPct[4]) + "%"
+          + "," + String(spreadPointC[5], 2) + "->" + String(spreadPowerPct[5]) + "%]");
     saveConfig();
-    server.sendHeader("Location", "/");
-    server.send(303);
-    
-    // Restart only if WiFi credentials changed
+
+    // Respond with JSON so JS fetch() can handle it without redirect
+    server.sendHeader("Cache-Control", "no-cache");
+    server.send(200, "application/json", "{\"ok\":true}");
+
     if (wifiChanged) {
-      sendLog("📡 WiFi credentials changed - restarting...");
-      delay(500);  // Let response finish sending
-      ESP.restart();  // Clean restart to apply new WiFi settings
+      sendLog("WiFi credentials changed - restarting...");
+      delay(500); ESP.restart();
     }
   });
 
   server.on("/pwmtest", HTTP_POST, []() {
     if (!pwmTest) {
       if (server.hasArg("pwm")) {
-        int testVal = server.arg("pwm").toInt();
-        pwm = map(constrain(testVal, 0, 100), 0, 100, 0, 255);
+        int v = server.arg("pwm").toInt();
+        pwm = map(constrain(v, 0, 100), 0, 100, 0, 255);
         analogWrite(PWM_PIN, pwm);
         pwmTest = true;
-        sendLog("🧪 Manual PWM test: STARTED → " + String(testVal) + "% → PWM=" + String(pwm));
+        sendLog("PWM test STARTED -> " + String(v) + "%");
       }
     } else {
-      pwmTest = false;
-      pwm = 0;
-      analogWrite(PWM_PIN, pwm);
-      sendLog("🛑 Manual PWM test: STOPPED");
+      pwmTest = false; pwm = 0; analogWrite(PWM_PIN, 0);
+      sendLog("PWM test STOPPED");
     }
     server.send(200);
   });
 
   server.on("/clearlog", HTTP_POST, []() {
-    logBuffer = "🧹 Log cleared.\n";
-    server.send(200);
-  });
-
-  server.on("/clearcal", HTTP_POST, []() {
-    if (SPIFFS.exists(CALIBRATION_FILE)) {
-      SPIFFS.remove(CALIBRATION_FILE);
-      sendLog("🧹 Calibration data cleared.");
-    } else {
-      sendLog("ℹ️ No calibration data to clear.");
-    }
-    server.send(200);
+    logBuffer = "Log cleared.\n"; server.send(200);
   });
 
   server.on("/clearlog_thermal", HTTP_POST, []() {
-    if (SPIFFS.exists(LOG_FILE)) {
-      SPIFFS.remove(LOG_FILE);
-      sendLog("🧹 Thermal log cleared.");
-    } else {
-      sendLog("ℹ️ No thermal log to clear.");
-    }
+    if (SPIFFS.exists(LOG_FILE)) { SPIFFS.remove(LOG_FILE); sendLog("Thermal log cleared."); }
+    else sendLog("No thermal log to clear.");
     server.send(200);
-  });
-
-  server.on("/downloadcal", HTTP_GET, []() {
-    if (SPIFFS.exists(CALIBRATION_FILE)) {
-      File f = SPIFFS.open(CALIBRATION_FILE, FILE_READ);
-      server.streamFile(f, "text/csv");
-      f.close();
-    } else {
-      server.send(404, "text/plain", "Calibration file not found");
-    }
   });
 
   server.on("/downloadlog", HTTP_GET, []() {
     if (SPIFFS.exists(LOG_FILE)) {
       File f = SPIFFS.open(LOG_FILE, FILE_READ);
-      server.streamFile(f, "text/csv");
-      f.close();
-    } else {
-      server.send(404, "text/plain", "No thermal log found");
-    }
+      server.streamFile(f, "text/csv"); f.close();
+    } else server.send(404, "text/plain", "No thermal log found");
   });
 
   server.begin();
-  sendLog("🌐 Web server started");
+  sendLog("Web server started");
 }
 
-void weatherTask(void* parameter) {
-  sendLog("🧵 Weather task started on core " + String(xPortGetCoreID()));
+// ==========================================================================
+//  WiFi RECONNECT
+// ==========================================================================
 
-  float outTemp = NAN, outHumidity = NAN;
-  for (;;) {
-    if (sensorSource == SOURCE_WEATHER) {
-      bool ok = fetchOutdoorWeather(&outTemp, &outHumidity);
-      if (ok) {
-        writeSensorValues(outTemp, outHumidity);
-      } else {
-        sendLog("⚠️ Weather fetch failed.");
-      }
+void handleWiFiReconnect() {
+  static unsigned long lastAttempt = 0, offlineSince = 0;
+  static bool wasDown = false;
+
+  if (wifiSSID.isEmpty()) return;
+
+  if (apFallbackActive) {
+    static unsigned long lastScan = 0; static bool scanning = false;
+    unsigned long now = millis();
+    if (!scanning && now - lastScan >= AP_STA_SCAN_INTERVAL_MS) {
+      if (WiFi.getMode() == WIFI_AP) WiFi.mode(WIFI_AP_STA);
+      WiFi.scanNetworks(true); scanning = true; lastScan = now; return;
     }
+    if (scanning) {
+      int n = WiFi.scanComplete();
+      if (n == WIFI_SCAN_RUNNING) return;
+      scanning = false;
+      bool found = false;
+      if (n >= 0) {
+        for (int i = 0; i < n; i++) if (WiFi.SSID(i) == wifiSSID) { found = true; break; }
+        WiFi.scanDelete();
+      }
+      if (found) {
+        WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+        apFallbackActive = false; wasDown = true; offlineSince = lastAttempt = now;
+      } else if (WiFi.getMode() == WIFI_AP_STA) WiFi.mode(WIFI_AP);
+    }
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wasDown) {
+      wasDown = false;
+      sendLog("WiFi reconnected: " + WiFi.localIP().toString());
+      if (WiFi.getMode() == WIFI_AP_STA) { WiFi.mode(WIFI_STA); delay(200); }
+      delay(500);
+      if (!MDNS.begin("DewController")) sendLog("mDNS restart failed");
+      else sendLog("mDNS restarted");
+      server.stop(); delay(200); setupWebServer();
+      applyLocalTimezone();
+      if (!ntpInitialized) { setupNTP(); ntpInitialized = true; }
+      else handleNTP(true);
+    }
+    return;
+  }
+
+  if (!wasDown) { wasDown = true; offlineSince = millis(); sendLog("WiFi disconnected"); }
+  unsigned long now = millis();
+  if (now - lastAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+  lastAttempt = now;
+
+  wl_status_t s = WiFi.status();
+  if (s == WL_IDLE_STATUS || s == WL_DISCONNECTED) WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  else if ((s == WL_NO_SSID_AVAIL || s == WL_CONNECT_FAILED) && offlineSince && now - offlineSince > 90000) {
+    WiFi.disconnect(true, true); delay(200); WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str()); offlineSince = now;
+  } else WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+}
+
+// ==========================================================================
+//  LED
+// ==========================================================================
+
+void handleLEDStatus() {
+  static unsigned long lastT = 0; static bool state = false; static int mode = -1;
+  if (WiFi.getMode() == WIFI_AP) {
+    if (mode != 2) { mode = 2; lastT = millis(); state = false; }
+    if (millis() - lastT > 500) { lastT = millis(); state = !state; digitalWrite(LED_PIN, state); }
+  } else if (WiFi.status() == WL_CONNECTED) {
+    if (mode != 1) { mode = 1; digitalWrite(LED_PIN, ON); }
+  } else {
+    if (mode != 0) { mode = 0; digitalWrite(LED_PIN, OFF); }
+  }
+}
+
+// ==========================================================================
+//  SENSOR TASKS
+// ==========================================================================
+
+void weatherTask(void* p) {
+  float t = NAN, h = NAN;
+  for (;;) {
+    if (sensorSource == SOURCE_WEATHER && fetchOutdoorWeather(&t, &h))
+      writeSensorValues(t, h);
     delay(WEATHER_POLL_INTERVAL_MS);
   }
 }
 
-// Sensor task for AHT20
-void sensorTask_AHT20(void* parameter) {
-  sendLog("🧵 Sensor task (AHT20) started on core " + String(xPortGetCoreID()));
-  sendLog("🧪 SDA = " + String(I2C_SDA) + ", SCL = " + String(I2C_SCL));
-
-  I2CBus.begin(I2C_SDA, I2C_SCL);
-  delay(30);  // Increased delay for sensor stabilization
-
-  if (!aht.begin(&I2CBus)) {
-    sendLog("❌ AHT20 init failed - running I2C bus scan...");
-    
-    // Scan I2C bus to see what's present
-    bool foundAny = false;
-    for (uint8_t addr = 1; addr < 127; addr++) {
-      I2CBus.beginTransmission(addr);
-      if (I2CBus.endTransmission() == 0) {
-        sendLog("🔍 I2C device found at 0x" + String(addr, HEX));
-        foundAny = true;
-      }
-    }
-    
-    if (!foundAny) {
-      sendLog("❌ No I2C devices found on bus - check wiring/power");
-    } else {
-      sendLog("⚠️ I2C bus active but AHT20 not responding at 0x38");
-    }
-    
-    vTaskDelete(NULL);
-    return;
-  }
-
-  sendLog("✅ AHT20 initialized");
-
-  for (;;) {
-    sensors_event_t h, t;
-    aht.getEvent(&h, &t);
-
-    if (!isnan(t.temperature) && !isnan(h.relative_humidity)) {
-      writeSensorValues(t.temperature, h.relative_humidity);
-    } else {
-      sendLog("⚠️ AHT20 returned bad data, trying soft reset...");
-      I2CBus.beginTransmission(0x38);
-      I2CBus.write(0xBA);  // Soft reset
-      I2CBus.endTransmission();
-      delay(20);
-      aht.begin(&I2CBus);
-    }
-    delay(2000);
-  }
-}
-
-// Sensor task for SHT40
-void sensorTask_SHT40(void* parameter) {
-  sendLog("🧵 Sensor task (SHT40) started on core " + String(xPortGetCoreID()));
-  sendLog("🧪 SDA = " + String(I2C_SDA) + ", SCL = " + String(I2C_SCL));
-
-  I2CBus.begin(I2C_SDA, I2C_SCL);
-  delay(30);  // Increased delay for sensor stabilization
+void sensorTask_SHT40(void* p) {
+  sendLog("SHT40 task core " + String(xPortGetCoreID()));
+  I2CBus.begin(I2C_SDA, I2C_SCL); delay(30);
 
   if (!sht4.begin(&I2CBus)) {
-    sendLog("❌ SHT40 init failed - running I2C bus scan...");
-    
-    // Scan I2C bus to see what's present
-    bool foundAny = false;
-    for (uint8_t addr = 1; addr < 127; addr++) {
-      I2CBus.beginTransmission(addr);
-      if (I2CBus.endTransmission() == 0) {
-        sendLog("🔍 I2C device found at 0x" + String(addr, HEX));
-        foundAny = true;
-      }
+    sendLog("SHT40 init failed - I2C scan:");
+    bool any = false;
+    for (uint8_t a = 1; a < 127; a++) {
+      I2CBus.beginTransmission(a);
+      if (!I2CBus.endTransmission()) { sendLog("  0x" + String(a, HEX)); any = true; }
     }
-    
-    if (!foundAny) {
-      sendLog("❌ No I2C devices found on bus - check wiring/power");
-    } else {
-      sendLog("⚠️ I2C bus active but SHT40 not responding at 0x44");
-    }
-    
-    // Fallback to weather station
-    sendLog("🔄 Falling back to weather station for temperature/humidity data");
+    if (!any) sendLog("  No I2C devices found");
+    sendLog("Falling back to weather API");
     sensorSource = SOURCE_WEATHER;
     xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 0);
-    sendLog("📡 Weather task created as fallback");
-    
-    vTaskDelete(NULL);
-    return;
+    vTaskDelete(NULL); return;
   }
 
-  sendLog("✅ SHT40 initialized");
-
+  sendLog("SHT40 ready");
   sht4.setPrecision(SHT4X_HIGH_PRECISION);
   sht4.setHeater(SHT4X_NO_HEATER);
 
   for (;;) {
-    sensors_event_t humidity_event, temp_event;
-    sht4.getEvent(&humidity_event, &temp_event);
-
-    if (!isnan(temp_event.temperature) && !isnan(humidity_event.relative_humidity)) {
-      writeSensorValues(temp_event.temperature, humidity_event.relative_humidity);
-    } else {
-      sendLog("⚠️ SHT40 returned bad data");
-    }
-    
-    // Yield to other tasks more frequently
-    yield();
-    delay(3000);  // Longer delay to reduce I2C traffic
+    sensors_event_t he, te;
+    sht4.getEvent(&he, &te);
+    if (!isnan(te.temperature) && !isnan(he.relative_humidity))
+      writeSensorValues(te.temperature, he.relative_humidity);
+    else sendLog("SHT40 bad reading");
+    yield(); delay(3000);
   }
 }
 
-// Control task - Background: Heater control, calibration
-void controlTask(void* parameter) {
-  sendLog("🧵 Control task started on core " + String(xPortGetCoreID()));
+// ==========================================================================
+//  CONTROL TASK  (background, core 0)
+// ==========================================================================
 
-  unsigned long lastUpdate = 0;
-  unsigned long lastCalibrationUpdate = 0;
-  unsigned long lastCacheUpdate_local = 0;
-  
-  // Wait for sensor to stabilize
-  delay(2000);
-  
-  // Force immediate cache update on startup, then every 2 minutes
-  lastCacheUpdate_local = millis() - RSSI_UPDATE_INTERVAL_MS;
-  
+void controlTask(void* p) {
+  sendLog("Control task core " + String(xPortGetCoreID()));
+  delay(2000);  // wait for sensor to stabilise
+
+  unsigned long lastControl  = 0;
+  unsigned long lastThermal  = 0;
+  unsigned long lastCache    = millis() - RSSI_UPDATE_INTERVAL_MS;  // force immediate
+
   for (;;) {
     unsigned long now = millis();
-    
-    // Main heater control loop every second
-    if (now - lastUpdate >= APP_UPDATE_INTERVAL_MS) {
-      lastUpdate = now;
-      
-#if SIMULATE_HARDWARE
-      simulateHardware();
-#endif
-      updateGlassTemp();
+
+    // Heater control - every second
+    if (now - lastControl >= APP_UPDATE_INTERVAL_MS) {
+      lastControl = now;
       updateHeaterControl();
     }
-    
-    // Calibration (interval matches CAL_SAMPLE_INTERVAL_MS)
-    if (now - lastCalibrationUpdate >= CALIBRATION_UPDATE_INTERVAL_MS) {
-      lastCalibrationUpdate = now;
-      updateCalibration();
+
+    // Thermal log - every 10 minutes
+    if (now - lastThermal >= THERMAL_LOG_INTERVAL_MS) {
+      lastThermal = now;
+      logThermalData();
     }
-    
-    // Thermal lag logging every 10 minutes
-    static unsigned long lastThermalLog = 0;
-    if (now - lastThermalLog >= THERMAL_LOG_INTERVAL_MS) {
-      lastThermalLog = now;
-      logThermalLagInfo();
-    }
-    
-    // Update cache every 2 minutes
-    if (now - lastCacheUpdate_local >= RSSI_UPDATE_INTERVAL_MS) {
-      lastCacheUpdate_local = now;
-      
-      // Update dew point calculations
+
+    // Cache update - every 2 minutes
+    if (now - lastCache >= RSSI_UPDATE_INTERVAL_MS) {
+      lastCache = now;
       float t, h;
       readSensorValues(t, h);
-      
-      float td = dewPointC(t, h);
+      float td     = dewPointC(t, h);
       float spread = isnan(td) ? NAN : (t - td);
-      
-      yield();
-      String calFileSize = getCalibrationFileSizeKB(CALIBRATION_FILE);
-      yield();
-      String storageInfo = getStorageUsedSummary();
-      int rssi = WiFi.RSSI();
-      
-      if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1))) {
-        cached_td = td;
-        cached_spread = spread;
-        cached_calFileSize = calFileSize;
-        cached_storageInfo = storageInfo;
-        cached_rssi = rssi;
-        lastCacheUpdate = millis();
+      String stor  = getStorageUsedSummary();
+      int rssi     = WiFi.RSSI();
+      if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(5))) {
+        cached_td = td; cached_spread = spread;
+        cached_storageInfo = stor; cached_rssi = rssi;
         xSemaphoreGive(cacheMutex);
       }
     }
-    
-    // Control task cycle time
+
     delay(CONTROL_TASK_DELAY_MS);
   }
 }
 
+// ==========================================================================
+//  SETUP & LOOP
+// ==========================================================================
 
-// ------------------------------------------------------------
-// Auto-reconnect + mDNS reinit
-// ------------------------------------------------------------
-// Handles background Wi-Fi monitoring and gentle recovery if connection is lost
-void handleWiFiReconnect() {
-  static unsigned long lastReconnectAttempt = 0;
-  static unsigned long offlineSince = 0;
-  static bool wasDisconnected = false;
-
-  wifi_mode_t mode = WiFi.getMode();
-  wl_status_t status = WiFi.status();
-
-  bool haveCreds = !wifiSSID.isEmpty();   // we know user wants STA if SSID configured
-  if (!haveCreds) return;
-
-  // While in AP fallback, periodically scan for the target SSID and connect when found
-  if (apFallbackActive) {
-    static unsigned long lastScanTime = 0;
-    static bool scanInProgress = false;
-    unsigned long nowMs = millis();
-
-    // Start a new async scan every AP_STA_SCAN_INTERVAL_MS
-    if (!scanInProgress && (nowMs - lastScanTime >= AP_STA_SCAN_INTERVAL_MS)) {
-      sendLog("🔍 AP mode: scanning for SSID '" + wifiSSID + "'...");
-      if (WiFi.getMode() == WIFI_AP) {
-        WiFi.mode(WIFI_AP_STA);  // STA interface required to initiate a scan
-      }
-      WiFi.scanNetworks(true);  // async, non-blocking
-      scanInProgress = true;
-      lastScanTime = nowMs;
-      return;
-    }
-
-    if (scanInProgress) {
-      int n = WiFi.scanComplete();
-      if (n == WIFI_SCAN_RUNNING) return;  // still scanning
-
-      scanInProgress = false;
-      bool found = false;
-
-      if (n >= 0) {
-        for (int i = 0; i < n; i++) {
-          if (WiFi.SSID(i) == wifiSSID) {
-            found = true;
-            sendLog("📶 SSID '" + wifiSSID + "' visible (RSSI " + String(WiFi.RSSI(i)) + " dBm) — attempting STA connection...");
-            break;
-          }
-        }
-        WiFi.scanDelete();
-      } else {
-        sendLog("⚠️ WiFi scan error (" + String(n) + ") — staying in AP mode");
-        if (WiFi.getMode() == WIFI_AP_STA) WiFi.mode(WIFI_AP);  // revert to pure AP
-        return;
-      }
-
-      if (found) {
-        WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-        apFallbackActive = false;  // let reconnect logic manage the connection attempt
-        wasDisconnected = true;    // trigger post-connect recovery when STA succeeds
-        offlineSince = nowMs;
-        lastReconnectAttempt = nowMs;
-        return;
-      } else {
-        sendLog("📡 SSID not found — staying in AP mode (next scan in " + String(AP_STA_SCAN_INTERVAL_MS / 1000) + "s)");
-        if (WiFi.getMode() == WIFI_AP_STA) WiFi.mode(WIFI_AP);  // revert to pure AP
-        return;
-      }
-    }
-
-    return;  // AP fallback active, no scan due yet
-  }
-
-  // ---- Case 1: STA is connected ----
-  if (status == WL_CONNECTED) {
-    if (wasDisconnected) {
-      wasDisconnected = false;
-      offlineSince = 0;
-
-      sendLog("✅ Wi-Fi reconnected: " + WiFi.localIP().toString());
-      logWiFiStatus("WiFi");
-      apFallbackActive = false;  // Clear fallback flag on successful connection
-
-      // If we connected while in AP_STA mode (scanned and found SSID), drop the AP
-      if (WiFi.getMode() == WIFI_AP_STA) {
-        sendLog("📡 Switching from AP_STA to STA — AP no longer needed");
-        WiFi.mode(WIFI_STA);
-        delay(200);
-      }
-
-      delay(500); // give stack time to stabilise
-
-      if (!MDNS.begin("DewController")) {
-        sendLog("❌ Failed to restart mDNS responder!");
-      } else {
-        sendLog("✅ mDNS responder restarted as DewController.local");
-        yield();
-      }
-
-      server.stop();
-      delay(200);
-      setupWebServer();
-      sendLog("🌐 Web server rebound to Wi-Fi interface");
-
-      applyLocalTimezone();
-
-      if (!ntpInitialized) {
-        setupNTP();
-        ntpInitialized = true;
-      } else {
-        sendLog("⏱ NTP already active — skipping reinit");
-      }
-      
-      // Immediately attempt NTP sync after reconnection
-      handleNTP(true);
-    }
-    return;
-  }
-
-  // ---- Case 2: Not connected ----
-  if (!wasDisconnected) {
-    wasDisconnected = true;
-    offlineSince = millis();
-    sendLog("⚠️ Wi-Fi disconnected, will attempt reconnect...");
-    logWiFiStatus("WiFi");
-  }
-
-  unsigned long now = millis();
-  const unsigned long reconnectIntervalMs = 10000;
-  if (now - lastReconnectAttempt < reconnectIntervalMs) return;
-  lastReconnectAttempt = now;
-
-  // Check current status - don't interrupt if connection is in progress
-  if (status == WL_IDLE_STATUS || status == WL_DISCONNECTED) {
-    // Connection attempt finished but failed - safe to retry
-    if (mode == WIFI_AP) {
-      sendLog("🔁 Retrying STA connection from AP mode...");
-      WiFi.mode(WIFI_AP_STA);
-      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-    } else {
-      sendLog("🔁 Retrying WiFi connection...");
-      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-    }
-  }
-  else if (status == WL_NO_SSID_AVAIL || status == WL_CONNECT_FAILED) {
-    // Hard failure states - only after prolonged offline do a full reset
-    const unsigned long offlineResetMs = 90000; // 90s
-    if (offlineSince && (now - offlineSince > offlineResetMs)) {
-      sendLog("🧩 WiFi offline for >90s — performing hard reset...");
-      WiFi.disconnect(true, true);
-      delay(200);
-      WiFi.mode(WIFI_STA);
-      
-      esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-      if (netif) {
-        esp_netif_dhcpc_stop(netif);
-        delay(50);
-        esp_netif_set_hostname(netif, "DewController");
-        esp_netif_dhcpc_start(netif);
-      }
-      WiFi.setHostname("DewController");
-      
-      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-      offlineSince = now;  // Reset timer after hard reset
-    } else {
-      // Try again without disrupting the stack
-      sendLog("🔁 Retrying after connection failure...");
-      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-    }
-  }
-  // else: status is WL_SCAN_COMPLETED or other transient state - let it continue
-}
-
-void handleLEDStatus() {
-  static unsigned long lastLED = 0;
-  static bool ledState = false;
-  static int currentLedMode = -1;
-
-  if (WiFi.getMode() == WIFI_AP) {
-    if (currentLedMode != 2) {
-      currentLedMode = 2;
-      lastLED = millis();
-      ledState = false;
-      digitalWrite(LED_PIN, ledState);
-    }
-    if (millis() - lastLED > 500) {
-      lastLED = millis();
-      ledState = !ledState;
-      digitalWrite(LED_PIN, ledState);
-    }
-  } else if (WiFi.status() == WL_CONNECTED) {
-    if (currentLedMode != 1) {
-      currentLedMode = 1;
-      digitalWrite(LED_PIN, ON);
-    }
-  } else {
-    if (currentLedMode != 0) {
-      currentLedMode = 0;
-      digitalWrite(LED_PIN, OFF);
-    }
-  }
-}
-
-#if SIMULATE_HARDWARE
-void simulateHardware() {
-  ambientTemp = 17.0 + sin(millis() / 12000.0);
-  humidity = 78.0 + sin(millis() / 8000.0);
-}
-#endif
-
-void updateHeaterControl() {
-  // Persistent integral for PI
-  static float pwmIntegral = 0.0;
-  static bool dewGateLatched = false; // on/off hysteresis latch
-
-  if (pwmTest) return;                 // manual test overrides
-  if (!heaterEnabled || isnan(glassTemp)) {
-    // NOTE: integral resets on disable — on re-enable, output starts from
-    // Kp*error only (no integral history). This is intentional to avoid
-    // stale integral terms after extended off periods.
-    pwm = 0;
-    pwmIntegral = 0.0;
-    dewGateLatched = false;
-    dewGate = false;
-    analogWrite(PWM_PIN, pwm);
-    return;
-  }
-
-  float t, h;
-  readSensorValues(t, h);
-
-  // ---- Calculate dew point and control target ----
-  float td = dewPointC(t, h);
-
-  if (isnan(td)) {
-    // If dew point cannot be computed, fail-safe OFF
-    pwm = 0;
-    pwmIntegral = 0.0;
-    dewGate = false;
-    analogWrite(PWM_PIN, pwm);
-    return;
-  }
-
-  float spread = t - td;  // smaller spread => higher condensation risk (uses mutex-protected h)
-  
-  // Gate by dew spread with hysteresis
-  // ON when spread <= threshold; OFF when spread > threshold + hysteresis
-  if (!dewGateLatched && spread <= dewSpreadThreshold) {
-    dewGateLatched = true;
-  } else if (dewGateLatched && spread > (dewSpreadThreshold + dewSpreadHysteresis)) {
-    dewGateLatched = false;
-  }
-  dewGate = dewGateLatched;  // publish to global for logging
-
-  if (dewGate) {
-    // Control glass to be targetDelta °C ABOVE DEW POINT (not ambient)
-    float targetGlassTemp = td + targetDelta;
-    float error = targetGlassTemp - glassTemp;
-
-    // PI control constants
-    const float Kp = 20.0f;   // tune as needed
-    const float Ki = 0.02f;
-    const int   PWM_MIN = 26;   // ~10% keep-alive floor while dew gate is active
-    const int   PWM_MAX = 255;
-    const float integralMax = 500.0f;
-
-    // Only integrate when not saturated — prevents windup
-    float pwmValueF = Kp * error + Ki * pwmIntegral;
-    if (pwmValueF >= PWM_MIN && pwmValueF <= PWM_MAX) {
-      pwmIntegral += error;
-      if (pwmIntegral > integralMax) pwmIntegral = integralMax;
-      if (pwmIntegral < -integralMax) pwmIntegral = -integralMax;
-    }
-
-    // Single output computation using (possibly updated) integral
-    pwmValueF = Kp * error + Ki * pwmIntegral;
-    int pwmValue = constrain(int(pwmValueF), 0, PWM_MAX);
-
-    // Enforce minimum keep-alive power while dew gate is active
-    if (pwmValue < PWM_MIN) pwmValue = PWM_MIN;
-
-    pwm = pwmValue;
-  } else {
-    // Safe spread => heater off
-    pwm = 0;
-    pwmIntegral = 0.0;
-  }
-
-  analogWrite(PWM_PIN, pwm);
-}
-
-void updateCalibration() {
-  static unsigned long lastCalSampleTime = 0;
-  static bool firstCalSample = true;
-
-  // Reset statics when requested by /calibrate handler
-  if (calResetRequested) {
-    lastCalSampleTime = 0;
-    firstCalSample = true;
-    calResetRequested = false;
-  }
-
-  if (!calibrating) return;
-  if (millis() - lastCalSampleTime < CAL_SAMPLE_INTERVAL_MS) return;
-  lastCalSampleTime = millis();
-
-  float Ta, hUnused;
-  readSensorValues(Ta, hUnused);
-  float V = readThermistorVoltage();
-  int pwmPercent = pwm * 100 / 255;
-
-  struct tm timeinfo;
-  char timeStr[32] = "??";
-  if (getLocalTime(&timeinfo)) {
-    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  }
-
-  File f = SPIFFS.open(CALIBRATION_FILE, FILE_APPEND);
-  if (f) {
-    if (firstCalSample) {
-      String header = "Sample,Time,Ta,V_Thermistor,PWM%";
-      f.println(header);
-      sendLog(header);
-      firstCalSample = false;
-    }
-
-    String logLine = String(calCount + 1) + "," +
-                     String(timeStr) + "," +
-                     String(Ta, 2) + "," +
-                     String(V, 3) + "," +
-                     String(pwmPercent);
-
-    f.println(logLine);
-    f.close();
-
-    sendLog(logLine);
-    ++calCount;
-  } else {
-    sendLog("❌ Could not open calibration file for writing.");
-  }
-}
-
-void pruneThermalLog(const struct tm& timeinfo) {
-  if (!SPIFFS.exists(LOG_FILE)) {
-    // No file yet — just write session header and return
-    File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
-    if (f) {
-      char timeStr[32];
-      strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-      f.println("--- Session start: " + String(timeStr) + " ---");
-      f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH,PWM%,Vt,GateOn,TgTarget");
-      f.close();
-    }
-    sendLog("📝 Thermal log created");
-    return;
-  }
-
-  File check = SPIFFS.open(LOG_FILE, FILE_READ);
-  size_t fileSize = check.size();
-  check.close();
-
-  if (fileSize > MAX_THERMAL_LOG_SIZE) {
-    // Hard cap — keep most recent half from clean line boundary
-    File src = SPIFFS.open(LOG_FILE, FILE_READ);
-    src.seek(fileSize / 2);
-    src.readStringUntil('\n');  // discard partial line
-    String kept = src.readString();
-    src.close();
-    SPIFFS.remove(LOG_FILE);
-    File dst = SPIFFS.open(LOG_FILE, FILE_WRITE);
-    if (dst) {
-      dst.print(kept);
-      dst.close();
-      sendLog("⚠️ Thermal log exceeded 32KB — oldest half removed");
-    }
-  } else if (fileSize > LOG_PRUNE_SIZE) {
-    // Date-based prune — discard entries older than 2 days
-    struct tm cutoffTime = timeinfo;
-    cutoffTime.tm_hour = 0;
-    cutoffTime.tm_min  = 0;
-    cutoffTime.tm_sec  = 0;
-    cutoffTime.tm_mday -= 2;
-    time_t cutoff = mktime(&cutoffTime);
-
-    File src = SPIFFS.open(LOG_FILE, FILE_READ);
-    String kept = "";
-    while (src.available()) {
-      String line = src.readStringUntil('\n');
-      line.trim();
-      if (line.isEmpty()) continue;
-
-      // Always keep session separators and header lines
-      if (line.startsWith("---") || line.startsWith("Time,")) {
-        kept += line + "\n";
-        continue;
-      }
-
-      // Parse timestamp from start of CSV line
-      if (line.length() >= 19) {
-        struct tm rowTime = {};
-        if (strptime(line.c_str(), "%Y-%m-%d %H:%M:%S", &rowTime)) {
-          time_t rowEpoch = mktime(&rowTime);
-          if (rowEpoch >= cutoff) {
-            kept += line + "\n";
-          }
-        } else {
-          kept += line + "\n";  // unparseable — keep it
-        }
-      } else {
-        kept += line + "\n";  // short line — keep it
-      }
-    }
-    src.close();
-
-    SPIFFS.remove(LOG_FILE);
-    File dst = SPIFFS.open(LOG_FILE, FILE_WRITE);
-    if (dst) {
-      dst.print(kept);
-      dst.close();
-      sendLog("🔄 Thermal log pruned — entries older than date-2 removed");
-    }
-  } else {
-    sendLog("📝 Thermal log OK (" + String(fileSize / 1024.0, 1) + " KB)");
-  }
-
-  // Append session separator with real timestamp
-  File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
-  if (f) {
-    char timeStr[32];
-    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    f.println("--- Session start: " + String(timeStr) + " ---");
-    f.println("Time,Ta,Tg,Tg-Ta,dTa/dt_per_hr,Spread,Td,RH,PWM%,Vt,GateOn,TgTarget");
-    f.close();
-  }
-  sendLog("📝 Thermal log session started");
-}
-
-void handleNTP(bool forceCheck) {
-  static bool timeSynced = false;
-
-  // Force check on reconnection, otherwise only check until first successful sync
-  if (!forceCheck && timeSynced) return;
-
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
-    sendLog(String("✅ NTP time synchronized: ") + buf);
-    timeSynced = true;  // Stop checking once synced
-
-    // Prune once on first successful NTP sync this boot
-    if (!logPruned) {
-      logPruned = true;
-      pruneThermalLog(timeinfo);
-    }
-  } 
-  else {
-    sendLog("⚠️ NTP not yet synchronized, retrying...");
-    // Optional: re-init NTP in case config was lost
-    if (timezoneRule.isEmpty()) {
-      timezoneRule = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
-    }
-    setenv("TZ", timezoneRule.c_str(), 1);
-    tzset();
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  }
-}
-
-
-// ---------------- Setup ----------------
 void setup() {
-  // Create mutexes ABSOLUTELY FIRST — before any code that could call sendLog()
-  i2cMutex = xSemaphoreCreateMutex();
+  i2cMutex   = xSemaphoreCreateMutex();
   cacheMutex = xSemaphoreCreateMutex();
-  logMutex = xSemaphoreCreateMutex();
+  logMutex   = xSemaphoreCreateMutex();
+  logBuffer  = "";
 
-  logBuffer = "";
-#if DEBUG_MODE 
-  Serial.begin(115200);
-  delay(1200);
-  DEBUG_PRINT("🔍 Serial started at 115200 baud");
+#if DEBUG_MODE
+  Serial.begin(115200); delay(1200);
+  DEBUG_PRINT("Serial 115200");
 #endif
 
-  sendLog("🚀 Sketch started");
+  sendLog(String(DEVICE_NAME) + " " + String(DEVICE_VERSION));
 
   pinMode(PWM_PIN, OUTPUT);
   analogWriteFrequency(PWM_PIN, 1000);
@@ -1991,79 +1510,49 @@ void setup() {
   loadConfig();
   applyLocalTimezone();
   setupWiFi();
-  
-  sendLog("🏗 Initializing architecture...");
-  sendLog("   Main loop: Web Server, WiFi, mDNS, NTP (foreground)");
-  sendLog("   Background tasks: Sensors, Heater Control, Calibration");
+
+  sendLog("Starting tasks...");
+
+  xTaskCreatePinnedToCore(sensorTask_SHT40, "SHT40Task", 8192, NULL, 1, &sensorTaskHandle, 0);
+  sendLog("SHT40 task created");
   delay(100);
-  
-  // Background: Sensor tasks
-  if (sensorSource == SOURCE_SHT40) {
-    xTaskCreatePinnedToCore(sensorTask_SHT40, "SensorTask_SHT40", 8192, NULL, 1, &sensorTaskHandle, 0);
-    sendLog("📡 SHT40 sensor task created");
-  } else if (sensorSource == SOURCE_WEATHER) {
-    xTaskCreatePinnedToCore(weatherTask, "WeatherTask", 8192, NULL, 1, NULL, 0);
-    sendLog("📡 Weather task created");
-  } else {  // SOURCE_AHT20
-    xTaskCreatePinnedToCore(sensorTask_AHT20, "SensorTask_AHT20", 8192, NULL, 1, &sensorTaskHandle, 0);
-    sendLog("📡 AHT20 sensor task created");
-  }
-  delay(100);  // Wait for sensor task to start and initialize
-  
-  // Background: Heater control task
+
   xTaskCreatePinnedToCore(controlTask, "ControlTask", 8192, NULL, 1, &controlTaskHandle, 0);
-  sendLog("🔥 Heater control task created");
-  
-  delay(100);  // Let control task start and log
-  sendLog("✅ Architecture initialized - Web GUI in main loop");
-  delay(50);
+  sendLog("Control task created");
+  delay(100);
+
+  sendLog("Ready - spread table dew control active");
+  sendLog("   Table: " + String(spreadPointC[0], 2) + "C->" + String(spreadPowerPct[0]) + "%"
+    ", " + String(spreadPointC[1], 2) + "C->" + String(spreadPowerPct[1]) + "%"
+    ", " + String(spreadPointC[2], 2) + "C->" + String(spreadPowerPct[2]) + "%"
+    ", " + String(spreadPointC[3], 2) + "C->" + String(spreadPowerPct[3]) + "%"
+    ", " + String(spreadPointC[4], 2) + "C->" + String(spreadPowerPct[4]) + "%"
+    ", " + String(spreadPointC[5], 2) + "C->" + String(spreadPowerPct[5]) + "%");
+  sendLog("   Spread > " + String(spreadPointC[0], 2) + "C -> Off");
+  sendLog("   Max Power: " + String(maxPwmPercent) + "%");
+  sendLog("   Rise Hysteresis: " + String(spreadRiseHystC, 2) + "C");
 }
 
-// ---------------- Loop ----------------
 void loop() {
-  // Main loop: Web server and network operations (foreground)
-  static unsigned long lastWiFiCheck = 0;
-  static unsigned long lastNTPCheck = 0;
-  static unsigned long lastHealthCheck = 0;
-  
+  static unsigned long lastWiFi = 0, lastNTP = 0, lastHealth = 0;
   unsigned long now = millis();
-  
-  // Handle web requests - highest priority for responsive GUI
+
   server.handleClient();
   yield();
-  
-  // LED status indication
   handleLEDStatus();
-  
-  // WiFi reconnect every 10 seconds
-  if (now - lastWiFiCheck >= WIFI_RECONNECT_INTERVAL_MS) {
-    lastWiFiCheck = now;
-    handleWiFiReconnect();
-  }
-  
-  // NTP sync every 2 minutes
-  if (now - lastNTPCheck >= NTP_CHECK_INTERVAL_MS) {
-    lastNTPCheck = now;
-    handleNTP();
-  }
-  
-  // Monitor background task health every 60 seconds
-  if (now - lastHealthCheck > 60000) {
-    lastHealthCheck = now;
-    
-    // Check if control task is still running
+
+  if (now - lastWiFi >= WIFI_RECONNECT_INTERVAL_MS) { lastWiFi = now; handleWiFiReconnect(); }
+  if (now - lastNTP  >= NTP_CHECK_INTERVAL_MS)       { lastNTP  = now; handleNTP(); }
+
+  if (now - lastHealth > 60000) {
+    lastHealth = now;
     if (controlTaskHandle && eTaskGetState(controlTaskHandle) == eDeleted) {
-      sendLog("⚠️ Control task died - system restart required");
-      ESP.restart();
+      sendLog("Control task died - restarting"); ESP.restart();
     }
-    
-    // Check if sensor task is still running
     if (sensorTaskHandle && eTaskGetState(sensorTaskHandle) == eDeleted) {
-      sendLog("⚠️ Sensor task died - system restart required");
-      ESP.restart();
+      sendLog("Sensor task died - restarting"); ESP.restart();
     }
   }
-  
-  // Fast loop cycle for responsive web interface
+
   delay(MAIN_LOOP_DELAY_MS);
 }
