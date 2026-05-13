@@ -28,10 +28,11 @@
 #define DEBUG_MODE 0
 #endif
 
-#define DEVICE_VERSION        "v5.0.1"
+#define DEVICE_VERSION        "v5.1.0"
 #define DEVICE_NAME           "DewHeaterController"
 #define CONFIG_FILE           "/config.json"
 #define LOG_FILE              "/thermal.log"
+static const char* THERMAL_LOG_HEADER = "Time,Ta,Td,Spread,RH,RingTemp,PWM%,Vt";
 #define LOG_PRUNE_SIZE        16384       // 16 KB - date-based prune threshold
 #define MAX_THERMAL_LOG_SIZE  32768       // 32 KB - hard cap, truncates oldest half
 
@@ -156,10 +157,17 @@ void pruneThermalLog(const struct tm& timeinfo);
 void sendLog(const String& msg);
 
 const int SPREAD_POWER_TABLE_SIZE = 6;
-float spreadPointC[SPREAD_POWER_TABLE_SIZE] = {4.0f, 3.0f, 2.0f, 1.0f, 0.5f, 0.0f};
-int spreadPowerPct[SPREAD_POWER_TABLE_SIZE] = {15, 25, 40, 65, 75, 85};
 const float DEFAULT_SPREAD_POINT_C[SPREAD_POWER_TABLE_SIZE] = {4.0f, 3.0f, 2.0f, 1.0f, 0.5f, 0.0f};
-const int DEFAULT_SPREAD_POWER_PCT[SPREAD_POWER_TABLE_SIZE] = {15, 25, 40, 65, 75, 85};
+const int DEFAULT_SPREAD_POWER_PCT[SPREAD_POWER_TABLE_SIZE] = {20, 40, 60, 80, 90, 100};
+float spreadPointC[SPREAD_POWER_TABLE_SIZE];
+int spreadPowerPct[SPREAD_POWER_TABLE_SIZE];
+
+void resetSpreadTableToDefaults() {
+  for (int i = 0; i < SPREAD_POWER_TABLE_SIZE; i++) {
+    spreadPointC[i] = DEFAULT_SPREAD_POINT_C[i];
+    spreadPowerPct[i] = DEFAULT_SPREAD_POWER_PCT[i];
+  }
+}
 
 void sanitizeSpreadTable() {
   for (int i = 0; i < SPREAD_POWER_TABLE_SIZE; i++) {
@@ -503,7 +511,7 @@ void logThermalData() {
   if (f) {
     char buf[200];
     snprintf(buf, sizeof(buf),
-             "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%s,%.3f",
+             "%s,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.3f",
              timeStr,
              Ta,
              isnan(Td)     ? 0.0f : Td,
@@ -511,7 +519,6 @@ void logThermalData() {
              RH,
              ringT,
              pwmPct,
-             phaseLabel().c_str(),
              analogRead(THERMISTOR_PIN) * 3.3f / 4095.0f);
     f.println(buf);
     f.close();
@@ -525,7 +532,7 @@ void pruneThermalLog(const struct tm& timeinfo) {
       char ts[32];
       strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo);
       f.println("--- Session start: " + String(ts) + " ---");
-      f.println("Time,Ta,Td,Spread,RH,RingTemp,PWM%,Phase,Vt");
+      f.println(THERMAL_LOG_HEADER);
       f.close();
     }
     sendLog("Thermal log created");
@@ -577,7 +584,7 @@ void pruneThermalLog(const struct tm& timeinfo) {
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo);
     f.println("--- Session start: " + String(ts) + " ---");
-    f.println("Time,Ta,Td,Spread,RH,RingTemp,PWM%,Phase,Vt");
+    f.println(THERMAL_LOG_HEADER);
     f.close();
   }
   sendLog("Thermal log session started");
@@ -711,8 +718,8 @@ void setupWebServer() {
 <title>Dew Heater Controller</title>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d;
-    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --bg: #ffffff; --panel: #ffffff; --border: #d0d0d0;
+    --text: #000000; --muted: #333333; --accent: #0066cc;
     --green: #3fb950; --amber: #d29922; --red: #f85149;
     --preheat-col: #d29922; --active-col: #58a6ff; --sat-col: #f85149;
   }
@@ -749,7 +756,7 @@ void setupWebServer() {
   .row label { flex: 0 0 160px; color: var(--muted); font-size: 0.8rem; }
   .row input[type=text], .row input[type=password] { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 0.85rem; }
   .powertable input.num { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 0.85rem; width: 100%; min-width: 0; text-align: right; }
-  .row input[type=text]:focus, .row input[type=password]:focus, .powertable input.num:focus { outline: none; border-color: #9aa4af; background: #2a3037; }
+  .row input[type=text]:focus, .row input[type=password]:focus, .powertable input.num:focus { outline: none; border-color: #7a7a7a; background: #ffffff; }
   .row input.num { flex: 0 0 82px; width: 82px; text-align: right; }
   .row .hint { min-width: 128px; text-align: right; color: var(--muted); font-size: 0.78rem; }
   .powertable { margin: 10px 0 12px; border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; }
@@ -759,7 +766,7 @@ void setupWebServer() {
   .powertable col.col-watts  { width: 64px; }
   .powertable th, .powertable td { padding: 5px 6px; border-bottom: 1px solid var(--border); font-size: 0.78rem; white-space: nowrap; }
   .powertable tr:last-child td { border-bottom: none; }
-  .powertable th { color: var(--muted); text-align: right; background: #0f141c; }
+  .powertable th { color: var(--muted); text-align: right; background: #f2f2f2; }
   .powertable th:nth-child(1), .powertable td:nth-child(1) { text-align: right; }
   .powertable th:nth-child(2), .powertable td:nth-child(2) { text-align: right; }
   .powertable th:nth-child(3), .powertable td:nth-child(3) { text-align: right; }
@@ -783,8 +790,8 @@ void setupWebServer() {
   /* -- Log -- */
   #log-header { display: flex; justify-content: space-between; align-items: center; padding: 6px 16px; border-bottom: 1px solid var(--border); }
   #log-header span { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
-  #log { flex: 1; overflow-y: auto; background: var(--bg); padding: 10px 16px; white-space: pre-wrap; font-size: 0.8rem; line-height: 1.5; color: #8b949e; min-height: 200px; max-height: calc(100vh - 420px); }
-  #log .ts { color: #3d4450; }
+  #log { flex: 1; overflow-y: auto; background: var(--bg); padding: 10px 16px; white-space: pre-wrap; font-size: 0.8rem; line-height: 1.5; color: #000000; min-height: 200px; max-height: calc(100vh - 420px); }
+  #log .ts { color: #4a4a4a; }
 
   /* -- Modal -- */
   .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 999; justify-content: center; align-items: center; }
@@ -1494,6 +1501,8 @@ void setup() {
   cacheMutex = xSemaphoreCreateMutex();
   logMutex   = xSemaphoreCreateMutex();
   logBuffer  = "";
+
+  resetSpreadTableToDefaults();
 
 #if DEBUG_MODE
   Serial.begin(115200); delay(1200);
